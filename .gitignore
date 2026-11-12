@@ -1,0 +1,16 @@
+# Build outputs
+bin/
+obj/
+publish/
+publish-selfcontained/
+*.user
+.vs/
+.vscode/
+
+# Runtime data (lives under %APPDATA%\DeskLite, not in repo)
+*.log
+
+# OS / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
