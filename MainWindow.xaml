@@ -1,0 +1,8 @@
+<Window
+    x:Class="DeskLite.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="桌面助手">
+    <!-- 全部界面由 MainWindow.xaml.cs 代码构建，便于按 N×M / 标签页 / 3×3 动态生成 -->
+    <Grid x:Name="Root" Background="#FF1A1622" />
+</Window>
