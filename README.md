@@ -16,11 +16,12 @@
 
 | 文件 / File | 说明 / Description |
 | --- | --- |
-| `v1.7.0_DeskLite.exe` | 单文件可执行程序（self-contained single-file build）。无需安装 .NET 或 Windows App SDK，双击即用。 |
-| `v1.7.0_DeskLite-win-x64-selfcontained.zip` | 完整自包含发布包（解压后运行 `DeskLite.exe`）。同样无需安装运行时，适合需要查看/替换随附文件的场景。 |
+| **`v1.7.0_DeskLite-win-x64-selfextract.exe`** | **推荐 / Recommended** — 自解压 EXE：双击后自动解压运行环境并启动 DeskLite，无需安装 .NET 或 Windows App SDK。首次运行需解压约 230 MB 运行时，请稍候数秒。/ Self-extracting EXE: double-click to unpack the bundled runtime and launch DeskLite. |
+| `v1.7.0_DeskLite-win-x64-selfcontained.zip` | 完整自包含发布包：解压到任意目录后运行其中的 `DeskLite.exe`，适合固定目录、反复启动的场景。/ Full self-contained package: unzip anywhere and run `DeskLite.exe`. |
 
 > 环境要求 / Requirements: Windows 10 19041 (2004) 或更高版本，x64。
 > 首次运行时程序会在 `%APPDATA%\DeskLite\` 创建配置目录，不会改写磁盘上的快捷方式源文件。
+> 说明：WinUI 3 / WinAppSDK 的 WinRT 激活机制不支持纯单文件 EXE 打包，因此 EXE 形态采用自解压封装（内部为完整运行时目录）。/ A pure single-file EXE is not supported by WinUI 3 WinRT activation, so the EXE build uses a self-extracting wrapper.
 
 ---
 
@@ -70,9 +71,7 @@ dotnet publish -c Release -r win-x64
 # 自包含（免装 .NET / WinAppSDK）
 dotnet publish -c Release -r win-x64 -p:SelfContained=true -p:WindowsPackageType=None
 
-# 单文件 EXE
-dotnet publish -c Release -r win-x64 -p:SelfContained=true -p:WindowsPackageType=None `
-  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+# 生成自解压 EXE 需先用 WinRAR 打包 selfcontained 目录（见 Release 说明）
 ```
 
 发布产物位于 `publish/`，双击 `DeskLite.exe` 即可使用。
