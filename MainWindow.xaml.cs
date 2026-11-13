@@ -39,15 +39,33 @@ public sealed partial class MainWindow : Window
     private Grid _mainLayout = null!;
     private Grid _overlay = null!;
     private Grid _recentGrid = null!;
-    private Grid _grid1 = null!;
-    private Grid _grid2 = null!;
-    private StackPanel _tabsPanel = null!;
     private StackPanel _toastList = null!;
-    private Slider _wheelV = null!, _wheelH = null!, _wheel2 = null!;
+    private Slider _wheelV = null!, _wheelH = null!;
+
+    // v1.7：每个「快捷方式管理」模块持有自己的一组控件引用，彼此互不干扰
+    private StackPanel _modulesHost = null!;
+    private readonly List<ModuleRefs> _moduleRefs = new();
+    /// <summary>模块 Id + 名称的拼接签名；变化时才重建模块控件树。</summary>
+    private string _lastModuleSignature = "";
+
+    /// <summary>一个模块的全部可变控件引用。</summary>
+    private sealed class ModuleRefs
+    {
+        public string Id = "";
+        public FrameworkElement Section = null!;
+        public TextBlock Title = null!;
+        public TextBlock Index = null!;
+        public StackPanel TabsPanel = null!;
+        public Grid Grid1 = null!;
+        public Grid Grid2 = null!;
+        public Slider Wheel2 = null!;
+        public TextBlock T1Count = null!, T2Path = null!;
+        public FrameworkElement RightPanel = null!;
+    }
 
     // 状态文字
     private TextBlock _statusText = null!, _modeText = null!, _chipPx = null!;
-    private TextBlock _recentCount = null!, _gridPill = null!, _t1Count = null!, _t2Path = null!;
+    private TextBlock _recentCount = null!, _gridPill = null!, _moduleCountPill = null!;
     private Button _btnAuto = null!, _btnManual = null!;
 
     // 浮层
@@ -78,12 +96,13 @@ public sealed partial class MainWindow : Window
     private TextBlock _editCaption = null!;
     private TextBox _editName = null!, _editTarget = null!;
     private StackPanel _editColors = null!, _editTargetRow = null!, _editColorRow = null!;
-    private string? _editId;
-    private bool _editIsTab;
+    private Button _editDeleteBtn = null!;
+    private string? _editId, _editModuleId;
+    private bool _editIsTab, _editIsModule;
     private int _editPick = -1;
 
     // v1.4-4/5：滚轮落点面板、自定义拖动区
-    private FrameworkElement _recentPanel = null!, _rightPanel = null!, _titleRow = null!;
+    private FrameworkElement _recentPanel = null!, _titleRow = null!;
     private bool _rootWheelAttached, _syncingWheels;
 
     // v1.5 改善 1：待回收区域浮层
@@ -95,7 +114,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Title = "桌面助手 · DeskLite v1.6";
+        Title = "桌面助手 · DeskLite v1.7";
         _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         // v1.4-5：无边框窗口（无系统标题栏 / 关闭按钮），设置与托盘右键是唯一退出通道
         ConfigureBorderless();
@@ -544,7 +563,7 @@ public sealed partial class MainWindow : Window
         var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8,
             VerticalAlignment = VerticalAlignment.Center };
         brand.Children.Add(T("桌面助手", 13, bold: true));
-        brand.Children.Add(T("v1.6 · 图标无箭头", 10, "#8A829C"));
+        brand.Children.Add(T("v1.7 · 快捷方式管理多模块", 10, "#8A829C"));
 
         var seg = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, Padding = new Thickness(2),
             Background = B("#FFFFFF", 0.06), CornerRadius = new CornerRadius(9) };
@@ -614,6 +633,10 @@ public sealed partial class MainWindow : Window
         Padding = new Thickness(8, 2, 8, 2), Child = text
     };
 
+    /// <summary>
+    /// v1.7：快捷方式管理升级为「模块容器」。顶部保留总标题与「＋ 新增模块」，
+    /// 下方 ScrollViewer 内按配置顺序垂直堆叠 N 个功能相同、可独立命名的模块。
+    /// </summary>
     private FrameworkElement BuildShortcutSection()
     {
         var outer = Panel();
@@ -621,8 +644,93 @@ public sealed partial class MainWindow : Window
         var stack = new Grid();
         stack.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Auto) });
         stack.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        var hdr = SectionHeader("快捷方式管理", "左侧一层标签页 · 右侧二层收纳", out var right);
+        var hdr = SectionHeader("快捷方式管理", "可在其下拓展 N 个功能相同、可独立命名的模块", out var right);
+        _moduleCountPill = T("--", 10, "#A9A2B9");
+        right.Children.Add(Pill(_moduleCountPill));
         right.Children.Add(Pill(T("二级窗口 3×3", 10, "#A9A2B9")));
+        var addModule = Bt("＋ 新增模块", (_, _) => AskAddModule());
+        addModule.Background = B("#B45CF0", 0.35);
+        addModule.BorderBrush = B("#B45CF0", 0.6);
+        ToolTipService.SetToolTip(addModule, "新增模块时可选择空白或以当前模块为模板复制");
+        right.Children.Add(addModule);
+        stack.Children.Add(hdr);
+
+        _lastModuleSignature = "";      // 主题切换后控件树重建，必须强制重放模块
+        _moduleRefs.Clear();
+        _modulesHost = new StackPanel { Spacing = 8, Margin = new Thickness(8, 0, 8, 8) };
+        var scroll = new ScrollViewer
+        {
+            VerticalScrollMode = ScrollMode.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollMode = ScrollMode.Disabled,
+            Content = _modulesHost
+        };
+        Grid.SetRow(scroll, 1);
+        stack.Children.Add(scroll);
+        outer.Child = stack;
+        return outer;
+    }
+
+    /// <summary>模块集合 / 名称 / 顺序变化时重建模块控件树；否则只刷新数据，避免无谓重绘。</summary>
+    private void EnsureModulesBuilt()
+    {
+        if (_modulesHost == null) return;
+        var modules = _c.Modules;
+        string sig = string.Join("|", modules.Select(m => m.Id + ":" + m.Name));
+        if (sig == _lastModuleSignature && _moduleRefs.Count == modules.Count) return;
+        _lastModuleSignature = sig;
+        _moduleRefs.Clear();
+        _modulesHost.Children.Clear();
+        for (int i = 0; i < modules.Count; i++)
+            _modulesHost.Children.Add(BuildModuleSection(modules[i], i, modules.Count));
+        _moduleCountPill.Text = $"{modules.Count} 个模块";
+    }
+
+    /// <summary>
+    /// 构建一个完整的「快捷方式管理」模块：标题栏（改名 / 复制 / 上移 / 下移 / 删除）
+    /// + 左侧一层大类 + 右侧二层 3×3 收纳。所有交互回调都先切到本模块再执行。
+    /// </summary>
+    private FrameworkElement BuildModuleSection(ShortcutModule m, int index, int total)
+    {
+        string mid = m.Id;
+        var refs = new ModuleRefs { Id = mid };
+        var outer = Panel(10);
+        outer.BorderBrush = B("#B45CF0", 0.28);
+        outer.Margin = new Thickness(0, 2, 0, 2);
+        outer.Height = 240;
+        refs.Section = outer;
+
+        var stack = new Grid();
+        stack.RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) });
+        stack.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+        // 模块标题栏
+        var hdr = new Grid { Margin = new Thickness(10, 4, 10, 0) };
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Auto) });
+        hdr.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        refs.Title = T(m.Name, 12, bold: true);
+        refs.Index = T($"模块 {index + 1}/{total}", 10, "#8A829C");
+        refs.Index.Margin = new Thickness(9, 2, 0, 0);
+        Grid.SetColumn(refs.Title, 0); Grid.SetColumn(refs.Index, 1);
+        hdr.Children.Add(refs.Title); hdr.Children.Add(refs.Index);
+
+        var acts = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4,
+            HorizontalAlignment = HorizontalAlignment.Right };
+        acts.Children.Add(Bt("改名", (_, _) => OpenModuleEditor(mid)));
+        acts.Children.Add(Bt("复制", (_, _) => DuplicateModule(mid)));
+        var up = Bt("↑", (_, _) => _c.MoveModule(mid, -1));
+        var down = Bt("↓", (_, _) => _c.MoveModule(mid, 1));
+        ToolTipService.SetToolTip(up, "上移模块");
+        ToolTipService.SetToolTip(down, "下移模块");
+        acts.Children.Add(up); acts.Children.Add(down);
+        var del = Bt("删除", (_, _) => ConfirmDeleteModule(mid), "#FFFFFF");
+        del.Background = B("#C94F6D", 0.55);
+        del.BorderBrush = B("#C94F6D", 0.8);
+        acts.Children.Add(del);
+        Grid.SetColumn(acts, 2);
+        hdr.Children.Add(acts);
+        Grid.SetRow(hdr, 0);
         stack.Children.Add(hdr);
 
         var split = new Grid();
@@ -640,23 +748,22 @@ public sealed partial class MainWindow : Window
         lg.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         var lh = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, Padding = new Thickness(9, 6, 9, 6) };
         lh.Children.Add(T("一层快捷方式", 11, bold: true));
-        _t1Count = T("--", 10, "#8A829C");
-        lh.Children.Add(_t1Count);
+        refs.T1Count = T("--", 10, "#8A829C");
+        lh.Children.Add(refs.T1Count);
         lg.Children.Add(lh);
-        _tabsPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Margin = new Thickness(8, 0, 8, 0) };
-        Grid.SetRow(_tabsPanel, 1);
-        lg.Children.Add(_tabsPanel);
-        // v1.3：拖放统一由根容器处理。透明色刷（非 null）让网格参与命中测试，
-        // null 背景的 Grid 在 XAML 中不参与命中，是旧版拖放失效的次要原因。
-        _grid1 = new Grid { Margin = new Thickness(8), Background = B("#000000", 0),
+        refs.TabsPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3,
+            Margin = new Thickness(8, 0, 8, 0) };
+        Grid.SetRow(refs.TabsPanel, 1);
+        lg.Children.Add(refs.TabsPanel);
+        // 透明色刷（非 null）让网格参与命中测试，是 v1.3 拖放修复的一部分。
+        refs.Grid1 = new Grid { Margin = new Thickness(8), Background = B("#000000", 0),
             VerticalAlignment = VerticalAlignment.Top };
-        // v1.4-4：一层条目多时由 ScrollViewer 原生支持鼠标滚轮，不再被裁剪。
         var grid1Scroll = new ScrollViewer
         {
             VerticalScrollMode = ScrollMode.Auto,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollMode = ScrollMode.Disabled,
-            Content = _grid1
+            Content = refs.Grid1
         };
         Grid.SetRow(grid1Scroll, 2);
         lg.Children.Add(grid1Scroll);
@@ -677,17 +784,18 @@ public sealed partial class MainWindow : Window
         rh.Margin = new Thickness(9, 6, 9, 6);
         var rt = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
         rt.Children.Add(T("二层快捷收纳", 11, bold: true));
-        _t2Path = T("· 未打开", 10, "#8A829C");
-        rt.Children.Add(_t2Path);
+        refs.T2Path = T("· 未打开", 10, "#8A829C");
+        rt.Children.Add(refs.T2Path);
         Grid.SetColumn(rt, 0); rh.Children.Add(rt);
         var more = Bt("修改…", (_, _) =>
         {
+            _c.SetActiveModule(mid);
             var f = _c.ActiveFolder();
             if (f == null) AddToast("尚未打开二层窗口", "请先点击左侧文件夹聚合图标，或右键任意图标进行修改。", "warn");
-            else OpenEditor(f.Id);
+            else OpenEditor(f.Id, mid);
         });
         Grid.SetColumn(more, 1); rh.Children.Add(more);
-        var close = Bt("×", (_, _) => _c.CloseFolder());
+        var close = Bt("×", (_, _) => { _c.SetActiveModule(mid); _c.CloseFolder(); });
         close.Margin = new Thickness(4, 0, 0, 0);
         Grid.SetColumn(close, 2); rh.Children.Add(close);
         rg.Children.Add(rh);
@@ -696,22 +804,73 @@ public sealed partial class MainWindow : Window
         t2Body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         t2Body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
         Grid.SetRow(t2Body, 1);
-        _grid2 = new Grid { Margin = new Thickness(8), Background = B("#000000", 0) };
-        Grid.SetColumn(_grid2, 0);
-        _wheel2 = new Slider { Orientation = Orientation.Vertical, Minimum = 0, Maximum = 100, Value = 0,
+        refs.Grid2 = new Grid { Margin = new Thickness(8), Background = B("#000000", 0) };
+        Grid.SetColumn(refs.Grid2, 0);
+        refs.Wheel2 = new Slider { Orientation = Orientation.Vertical, Minimum = 0, Maximum = 100, Value = 0,
             Width = 16, Margin = new Thickness(0, 8, 4, 8) };
-        _wheel2.ValueChanged += (s, e) => { if (!_loadingSettings && !_syncingWheels) _c.SetFolderPosition(e.NewValue / 100.0); };
-        Grid.SetColumn(_wheel2, 1);
-        t2Body.Children.Add(_grid2); t2Body.Children.Add(_wheel2);
+        refs.Wheel2.ValueChanged += (s, e) =>
+        {
+            if (_loadingSettings || _syncingWheels) return;
+            _c.SetActiveModule(mid);
+            _c.SetFolderPosition(e.NewValue / 100.0);
+        };
+        Grid.SetColumn(refs.Wheel2, 1);
+        t2Body.Children.Add(refs.Grid2); t2Body.Children.Add(refs.Wheel2);
         rg.Children.Add(t2Body);
         rightPane.Child = rg;
         Grid.SetColumn(rightPane, 1);
         split.Children.Add(rightPane);
-        _rightPanel = rightPane;   // v1.4-4：滚轮落点判定用
+        refs.RightPanel = rightPane;
 
         stack.Children.Add(split);
         outer.Child = stack;
+        _moduleRefs.Add(refs);
         return outer;
+    }
+
+    // ---------------- v1.7：模块管理动作 ----------------
+
+    private void AskAddModule()
+    {
+        EnqueueDialog(new DialogSpec(
+            "新增快捷方式管理模块",
+            "新模块与原模块功能完全相同，拥有独立的大类、快捷方式与交互状态。\n\n" +
+            "「空白模块」：自带 5 个默认大类，从零开始拖入；\n" +
+            "「复制当前模块」：以当前焦点模块为模板连全部内容复制一份（内部 Id 重新生成，之后互不影响）。",
+            "空白模块", () =>
+            {
+                _c.AddModule(false);
+                AddToast("已新增模块", "空白模块已追加到列表末尾，可点「改名」自定义名称。", "ok");
+            },
+            "复制当前模块", () =>
+            {
+                _c.AddModule(true);
+                AddToast("已复制模块", "已按当前模块内容生成副本，可点「改名」自定义名称。", "ok");
+            }));
+    }
+
+    private void DuplicateModule(string id)
+    {
+        string newId = _c.DuplicateModule(id);
+        AddToast(newId.Length > 0 ? "已复制模块" : "复制失败",
+            newId.Length > 0 ? "副本已插入到原模块下方，内容与 Id 均独立。" : "该模块可能已被删除。",
+            newId.Length > 0 ? "ok" : "warn");
+    }
+
+    private void ConfirmDeleteModule(string id)
+    {
+        var m = _c.FindModule(id);
+        if (m == null) return;
+        EnqueueDialog(new DialogSpec("删除管理模块？",
+            $"确定把模块「{m.Name}」及其全部大类、快捷方式移入待回收区吗？\n\n" +
+            $"将整体保留 {_c.RecycleRetentionDays} 天，期间可在标题栏「待回收区」一次性还原；至少需要保留一个模块。",
+            "移入待回收区", () =>
+            {
+                bool ok = _c.DeleteModule(id);
+                AddToast(ok ? "模块已移入待回收区" : "无法删除模块",
+                    ok ? $"模块「{m.Name}」已暂存，{_c.RecycleRetentionDays} 天内可整体还原。" : "至少需要保留一个管理模块。",
+                    ok ? "ok" : "warn");
+            }, "取消", null, true));
     }
 
     private FrameworkElement BuildStatusBar()
@@ -723,7 +882,7 @@ public sealed partial class MainWindow : Window
         _statusText = T("空闲", 10.5, "#4CD08A");
         _modeText = T("自动（跟随桌面）", 10.5, "#8A829C");
         _modeText.Margin = new Thickness(16, 0, 0, 0);
-        var note = T("v1.6 · 真实图标（默认无箭头角标） · 待回收区 7 天 · 右键修改/删除 · 设置中退出", 10, "#8A829C");
+        var note = T("v1.7 · 快捷方式管理 N 模块 · 真实图标（默认无箭头） · 待回收区 7 天 · 右键修改/删除 · 设置中退出", 10, "#8A829C");
         note.HorizontalAlignment = HorizontalAlignment.Right;
         Grid.SetColumn(_statusText, 0); Grid.SetColumn(_modeText, 1); Grid.SetColumn(note, 2);
         g.Children.Add(_statusText); g.Children.Add(_modeText); g.Children.Add(note);
@@ -891,9 +1050,9 @@ public sealed partial class MainWindow : Window
 
         var acts = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8,
             HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 14, 0, 0) };
-        var del = Bt("移入待回收区", (_, _) => ConfirmDelete(), "#FFFFFF");
-        del.Background = B("#C94F6D", 0.9); del.BorderBrush = B("#C94F6D");
-        acts.Children.Add(del);
+        _editDeleteBtn = Bt("移入待回收区", (_, _) => ConfirmDelete(), "#FFFFFF");
+        _editDeleteBtn.Background = B("#C94F6D", 0.9); _editDeleteBtn.BorderBrush = B("#C94F6D");
+        acts.Children.Add(_editDeleteBtn);
         acts.Children.Add(Bt("取消", (_, _) => _editBox.Visibility = Visibility.Collapsed));
         var save = Bt("保存", (_, _) => SaveEditor(), "#FFFFFF");
         save.Background = B("#B45CF0"); save.BorderBrush = B("#B45CF0");
@@ -972,7 +1131,12 @@ public sealed partial class MainWindow : Window
         foreach (var e in _c.RecycleEntries.OrderByDescending(x => x.DeletedAt))
         {
             string id = e.Id, name = e.Name;
-            string from = string.IsNullOrWhiteSpace(e.ParentName) ? e.TabName : e.TabName + " › " + e.ParentName;
+            // v1.7：来源按「模块 › 大类 › 父文件夹」展示；模块级记录直接显示模块名。
+            var parts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(e.ModuleName)) parts.Add(e.ModuleName!);
+            if (!string.IsNullOrWhiteSpace(e.TabName)) parts.Add(e.TabName);
+            if (!string.IsNullOrWhiteSpace(e.ParentName)) parts.Add(e.ParentName!);
+            string from = parts.Count > 0 ? string.Join(" › ", parts) : "—";
             string days = $"剩余 {_c.RecycleRemainingDays(e):F1} 天自动清除";
             var row = Panel(10);
             row.Padding = new Thickness(10);
@@ -1067,6 +1231,9 @@ public sealed partial class MainWindow : Window
         body.Children.Add(SettingRow("LRU", "超限淘汰策略", "达到上限后移除最久未打开的记录", ComboControl(new[] { "最近最少使用（LRU）", "先进先出（FIFO）" }, _c.Config.Recent.Policy == "fifo" ? 1 : 0, i => _c.SetPolicy(i == 0 ? "lru" : "fifo"))));
 
         body.Children.Add(SettingsTitle("快捷方式（需求 2 / 2.1 / 2.2）"));
+        body.Children.Add(SettingRow("⊞", "快捷方式管理模块（v1.7）",
+            "主窗口内垂直堆叠 N 个同构模块；每个模块可改名 / 复制 / 上移 / 下移 / 删除（整体进待回收区，7 天内可还原）",
+            ReadOnlyControl($"{_c.Modules.Count} 个")));
         body.Children.Add(SettingRow("3×3", "二层收纳网格", "固定 3 列 × 3 行可见 + 下拉滚动轮", ReadOnlyControl("3 × 3（固定）")));
         body.Children.Add(SettingRow("1st", "文件夹默认图标规则", "仅含快捷方式文件的文件夹 → 生成聚合图标", ComboControl(new[] { "字母排序第一项", "文件系统顺序第一项" }, _c.Config.Shortcuts.IconRule == "alpha-first" ? 0 : 1, i => _c.SetIconRule(i == 0 ? "alpha-first" : "first"))));
         body.Children.Add(SettingRow("→", "首次拖入自动打开二级窗口", "文件夹第一次被拖入时立即展开", SwitchControl(_c.Config.Shortcuts.AutoOpenFirst, v => _c.SetAutoOpenFirst(v))));
@@ -1116,8 +1283,8 @@ public sealed partial class MainWindow : Window
             })));
         body.Children.Add(SettingRow("⇩", "外部文件拖放", "窗口已登记为系统拖放目标；拖到标签页可指定大类，拖入过程见 dragdrop.log",
             ReadOnlyControl("双通道已启用")));
-        body.Children.Add(SettingRow("关于", "桌面助手 v1.6",
-            "WinUI 3 / Windows App SDK 2.5.1 / .NET 10 · 无边框 · 待回收区 · 真实图标（默认无箭头角标）",
+        body.Children.Add(SettingRow("关于", "桌面助手 v1.7",
+            "WinUI 3 / Windows App SDK 2.5.1 / .NET 10 · 快捷方式管理可拓展 N 模块 · 待回收区 · 真实图标（默认无箭头角标）",
             ReadOnlyControl("增量版本")));
 
         scroll.Content = body;
@@ -1226,6 +1393,7 @@ public sealed partial class MainWindow : Window
     private void RebuildData()
     {
         RefreshRecentGrid();
+        EnsureModulesBuilt();
         RefreshTabs();
         RefreshGrid1();
         RefreshGrid2();
@@ -1328,100 +1496,124 @@ public sealed partial class MainWindow : Window
 
     private void RefreshTabs()
     {
-        _tabsPanel.Children.Clear();
-        foreach (var tab in _c.Config.Shortcuts.Tabs)
+        foreach (var r in _moduleRefs)
         {
-            var b = Bt(tab.Name, (_, _) => _c.SetActiveTab(tab.Id));
-            b.Background = B(tab.Id == _c.ActiveTabId ? "#B45CF0" : "#FFFFFF", tab.Id == _c.ActiveTabId ? 0.32 : 0.05);
-            // v1.3：拖放落点落在该按钮范围内时归入此大类（由根容器统一解析，不再逐按钮挂事件）
-            b.Tag = tab.Id;
-            // v1.4-3：标签页大类也支持右键重命名 / 删除
-            b.ContextFlyout = TabMenu(tab);
-            ToolTipService.SetToolTip(b, "左键切换大类 · 右键重命名或删除");
-            _tabsPanel.Children.Add(b);
+            var m = _c.FindModule(r.Id);
+            if (m == null) continue;
+            string mid = m.Id;
+            r.Title.Text = m.Name;
+            r.TabsPanel.Children.Clear();
+            foreach (var tab in m.Tabs)
+            {
+                bool active = tab.Id == m.ActiveTabId;
+                var b = Bt(tab.Name, (_, _) =>
+                {
+                    _c.SetActiveModule(mid);
+                    _c.SetActiveTab(tab.Id);
+                });
+                b.Background = B(active ? "#B45CF0" : "#FFFFFF", active ? 0.32 : 0.05);
+                // v1.3：拖放落点落在该按钮范围内时归入此大类（由根容器统一解析）。
+                b.Tag = tab.Id;
+                b.ContextFlyout = TabMenu(tab, mid);
+                ToolTipService.SetToolTip(b, "左键切换大类 · 右键重命名或删除");
+                r.TabsPanel.Children.Add(b);
+            }
+            var add = Bt("＋ 新大类", (_, _) => { _c.SetActiveModule(mid); _c.AddTab(); });
+            add.Background = B("#FFFFFF", 0.03);
+            r.TabsPanel.Children.Add(add);
         }
-        var add = Bt("＋ 新大类", (_, _) => _c.AddTab());
-        add.Background = B("#FFFFFF", 0.03);
-        _tabsPanel.Children.Add(add);
     }
 
     private void RefreshGrid1()
     {
-        _grid1.Children.Clear();
-        _grid1.RowDefinitions.Clear();
-        _grid1.ColumnDefinitions.Clear();
-        var tab = _c.ActiveTab();
-        int cols = 5;
-        int rows = Math.Max(2, (int)Math.Ceiling(tab.Items.Count / (double)cols));
-        for (int j = 0; j < cols; j++) _grid1.ColumnDefinitions.Add(new ColumnDefinition());
-        for (int i = 0; i < rows; i++) _grid1.RowDefinitions.Add(new RowDefinition { Height = new GridLength(64) });
-
-        int px = Math.Clamp((int)(_c.AppPx * 0.55), 24, 38);
-        for (int idx = 0; idx < tab.Items.Count; idx++)
+        foreach (var r in _moduleRefs)
         {
-            var item = tab.Items[idx];
-            var cell = new Grid { Margin = new Thickness(3) };
-            var stack = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Center };
-            int color = item.IconOverride ?? item.ColorIndex;
-            string label = item.Type == "folder" ? _c.DefaultIconLabel(item) : Palette.Initial(item.DisplayName);
-            stack.Children.Add(IconVisual(label, color, px, RealIconForItem(item)));
-            var name = T(item.DisplayName, 10.5, "#A9A2B9");
-            name.HorizontalAlignment = HorizontalAlignment.Center;
-            name.MaxWidth = 92;
-            stack.Children.Add(name);
-            cell.Children.Add(stack);
-            if (item.Type == "folder")
+            var m = _c.FindModule(r.Id);
+            if (m == null) continue;
+            string mid = m.Id;
+            var tab = _c.ActiveTabOf(m);
+            r.Grid1.Children.Clear();
+            r.Grid1.RowDefinitions.Clear();
+            r.Grid1.ColumnDefinitions.Clear();
+            int cols = 5;
+            int rows = Math.Max(2, (int)Math.Ceiling(tab.Items.Count / (double)cols));
+            for (int j = 0; j < cols; j++) r.Grid1.ColumnDefinitions.Add(new ColumnDefinition());
+            for (int i = 0; i < rows; i++) r.Grid1.RowDefinitions.Add(new RowDefinition { Height = new GridLength(64) });
+
+            int px = Math.Clamp((int)(_c.AppPx * 0.55), 24, 38);
+            for (int idx = 0; idx < tab.Items.Count; idx++)
             {
-                var badge = new Border
+                var item = tab.Items[idx];
+                var cell = new Grid { Margin = new Thickness(3) };
+                var stack = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Center };
+                int color = item.IconOverride ?? item.ColorIndex;
+                string label = item.Type == "folder" ? _c.DefaultIconLabel(item) : Palette.Initial(item.DisplayName);
+                stack.Children.Add(IconVisual(label, color, px, RealIconForItem(item)));
+                var name = T(item.DisplayName, 10.5, "#A9A2B9");
+                name.HorizontalAlignment = HorizontalAlignment.Center;
+                name.MaxWidth = 92;
+                stack.Children.Add(name);
+                cell.Children.Add(stack);
+                if (item.Type == "folder")
                 {
-                    Background = B("#6C8CFF", 0.9), CornerRadius = new CornerRadius(8),
-                    Padding = new Thickness(4, 0, 4, 0), HorizontalAlignment = HorizontalAlignment.Right,
-                    VerticalAlignment = VerticalAlignment.Top, Child = T(item.Children.Count.ToString(), 9, "#FFFFFF")
-                };
-                cell.Children.Add(badge);
+                    var badge = new Border
+                    {
+                        Background = B("#6C8CFF", 0.9), CornerRadius = new CornerRadius(8),
+                        Padding = new Thickness(4, 0, 4, 0), HorizontalAlignment = HorizontalAlignment.Right,
+                        VerticalAlignment = VerticalAlignment.Top, Child = T(item.Children.Count.ToString(), 9, "#FFFFFF")
+                    };
+                    cell.Children.Add(badge);
+                }
+                Grid.SetRow(cell, idx / cols); Grid.SetColumn(cell, idx % cols);
+                var captured = item;
+                cell.Tapped += (_, _) => { _c.SetActiveModule(mid); _c.OpenShortcut(captured); };
+                cell.ContextFlyout = ItemMenu(captured, mid);
+                ToolTipService.SetToolTip(cell, "左键打开 · 右键修改或删除");
+                r.Grid1.Children.Add(cell);
             }
-            Grid.SetRow(cell, idx / cols); Grid.SetColumn(cell, idx % cols);
-            var captured = item;
-            cell.Tapped += (_, _) => _c.OpenShortcut(captured);
-            cell.ContextFlyout = ItemMenu(captured);
-            ToolTipService.SetToolTip(cell, "左键打开 · 右键修改或删除");
-            _grid1.Children.Add(cell);
+            r.T1Count.Text = $"{tab.Items.Count} 项";
         }
-        _t1Count.Text = $"{tab.Items.Count} 项";
     }
 
     private void RefreshGrid2()
     {
-        _grid2.Children.Clear();
-        _grid2.RowDefinitions.Clear();
-        _grid2.ColumnDefinitions.Clear();
-        int rows = Math.Clamp(_c.Config.Shortcuts.Grid2Rows, 1, 5);
-        int cols = Math.Clamp(_c.Config.Shortcuts.Grid2Cols, 1, 5);
-        for (int i = 0; i < rows; i++) _grid2.RowDefinitions.Add(new RowDefinition());
-        for (int j = 0; j < cols; j++) _grid2.ColumnDefinitions.Add(new ColumnDefinition());
-
-        var folder = _c.ActiveFolder();
-        _t2Path.Text = folder == null ? "· 未打开" : $"· {_c.ActiveTab().Name} › {folder.DisplayName}";
-        var window = _c.FolderWindow();
-        for (int idx = 0; idx < window.Count; idx++)
+        foreach (var r in _moduleRefs)
         {
-            var item = window[idx];
-            var cell = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center };
-            if (item != null)
+            var m = _c.FindModule(r.Id);
+            if (m == null) continue;
+            string mid = m.Id;
+            r.Grid2.Children.Clear();
+            r.Grid2.RowDefinitions.Clear();
+            r.Grid2.ColumnDefinitions.Clear();
+            int rows = Math.Clamp(_c.Config.Shortcuts.Grid2Rows, 1, 5);
+            int cols = Math.Clamp(_c.Config.Shortcuts.Grid2Cols, 1, 5);
+            for (int i = 0; i < rows; i++) r.Grid2.RowDefinitions.Add(new RowDefinition());
+            for (int j = 0; j < cols; j++) r.Grid2.ColumnDefinitions.Add(new ColumnDefinition());
+
+            var folder = _c.ActiveFolderOf(m);
+            r.T2Path.Text = folder == null ? "· 未打开"
+                : $"· {_c.ActiveTabOf(m).Name} › {folder.DisplayName}";
+            var window = _c.FolderWindowFor(m);
+            for (int idx = 0; idx < window.Count; idx++)
             {
-                cell.Children.Add(IconVisual(Palette.Initial(item.DisplayName), item.ColorIndex, 28, RealIconForItem(item)));
-                var name = T(item.DisplayName, 10.5, "#A9A2B9");
-                name.HorizontalAlignment = HorizontalAlignment.Center;
-                name.MaxWidth = 100;
-                cell.Children.Add(name);
-                var captured = item;
-                cell.Tapped += (_, _) => _c.OpenShortcut(captured);
-                cell.ContextFlyout = ItemMenu(captured);
-                ToolTipService.SetToolTip(cell, "左键打开 · 右键修改或删除");
+                var item = window[idx];
+                var cell = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center };
+                if (item != null)
+                {
+                    cell.Children.Add(IconVisual(Palette.Initial(item.DisplayName), item.ColorIndex, 28, RealIconForItem(item)));
+                    var name = T(item.DisplayName, 10.5, "#A9A2B9");
+                    name.HorizontalAlignment = HorizontalAlignment.Center;
+                    name.MaxWidth = 100;
+                    cell.Children.Add(name);
+                    var captured = item;
+                    cell.Tapped += (_, _) => { _c.SetActiveModule(mid); _c.OpenShortcut(captured); };
+                    cell.ContextFlyout = ItemMenu(captured, mid);
+                    ToolTipService.SetToolTip(cell, "左键打开 · 右键修改或删除");
+                }
+                Grid.SetRow(cell, idx / cols); Grid.SetColumn(cell, idx % cols);
+                r.Grid2.Children.Add(cell);
             }
-            Grid.SetRow(cell, idx / cols); Grid.SetColumn(cell, idx % cols);
-            _grid2.Children.Add(cell);
         }
         SyncWheels();
     }
@@ -1474,23 +1666,32 @@ public sealed partial class MainWindow : Window
         if (_dropHint != null) _dropHint.Visibility = Visibility.Collapsed;
     }
 
-    /// <summary>按落点找出目标标签页；不在标签栏上则返回 null（归入当前标签页）。</summary>
-    private string? ResolveTabId(Point clientPoint)
+    /// <summary>
+    /// v1.7：按落点解析目标模块与目标大类。
+    /// 落在某个大类按钮上 → 返回该模块 Id + 大类 Id；落在模块内其它区域 → 返回模块 Id，大类归当前选中项；
+    /// 落在模块容器之外 → 都返回 null，沿用当前焦点模块与当前大类。
+    /// </summary>
+    private (string? ModuleId, string? TabId) ResolveDropTarget(Point clientPoint)
     {
         try
         {
-            foreach (var child in _tabsPanel.Children)
+            foreach (var r in _moduleRefs)
             {
-                if (child is not FrameworkElement fe || fe.Tag is not string id) continue;
-                var bounds = fe.TransformToVisual(_root)
-                    .TransformBounds(new Rect(0, 0, fe.ActualWidth, fe.ActualHeight));
-                if (clientPoint.X >= bounds.X && clientPoint.X <= bounds.X + bounds.Width &&
-                    clientPoint.Y >= bounds.Y && clientPoint.Y <= bounds.Y + bounds.Height)
-                    return id;
+                bool insideSection = IsInside(r.Section, clientPoint);
+                foreach (var child in r.TabsPanel.Children)
+                {
+                    if (child is not FrameworkElement fe || fe.Tag is not string id) continue;
+                    var bounds = fe.TransformToVisual(_root)
+                        .TransformBounds(new Rect(0, 0, fe.ActualWidth, fe.ActualHeight));
+                    if (clientPoint.X >= bounds.X && clientPoint.X <= bounds.X + bounds.Width &&
+                        clientPoint.Y >= bounds.Y && clientPoint.Y <= bounds.Y + bounds.Height)
+                        return (r.Id, id);
+                }
+                if (insideSection) return (r.Id, null);
             }
         }
-        catch (Exception ex) { AppLog.Write("ResolveTabId", ex); }
-        return null;
+        catch (Exception ex) { AppLog.Write("ResolveDropTarget", ex); }
+        return (null, null);
     }
 
     /// <summary>
@@ -1509,9 +1710,20 @@ public sealed partial class MainWindow : Window
             AppLog.Drop("未识别到有效路径：" + string.Join(" | ", paths));
             return;
         }
-        string? tabId = explicitTabId ?? (clientPoint.HasValue ? ResolveTabId(clientPoint.Value) : null);
-        var tabName = _c.Config.Shortcuts.Tabs
-            .FirstOrDefault(t => t.Id == (tabId ?? _c.ActiveTabId))?.Name ?? "当前标签页";
+        // v1.7：先按落点（或显式大类）定位所属模块并切换焦点，后续所有业务方法都作用于该模块。
+        string? moduleId = null;
+        string? tabId = explicitTabId;
+        if (clientPoint.HasValue)
+        {
+            var hit = ResolveDropTarget(clientPoint.Value);
+            if (hit.ModuleId != null) moduleId = hit.ModuleId;
+            if (tabId == null) tabId = hit.TabId;
+        }
+        if (moduleId == null && tabId != null) moduleId = _c.ModuleOfTab(tabId)?.Id;
+        if (moduleId != null) _c.SetActiveModule(moduleId);
+        var moduleName = _c.ActiveModule().Name;
+        var tabName = _c.FindTab(tabId ?? _c.ActiveTabId)?.Name
+                      ?? _c.ActiveModule().Tabs.FirstOrDefault()?.Name ?? "当前标签页";
 
         // Win32 与 XAML 两条通道可能对同一次拖放各投递一次；1.2 秒内的相同路径集只处理一次
         var key = string.Join("|", valid.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
@@ -1550,18 +1762,19 @@ public sealed partial class MainWindow : Window
                            (conflicts.Count > 5 ? $" 等 {conflicts.Count} 项" : "");
             var pendingPaths = accepted;
             var pendingTab = tabId;
+            var pendingModule = moduleId;
             EnqueueDialog(new DialogSpec(
                 "检测到同名项，是否合并？",
-                $"目标大类「{tabName}」中已存在：{names}。\n\n" +
+                $"模块「{moduleName}」的目标大类「{tabName}」中已存在：{names}。\n\n" +
                 "「合并」：同名项并入已有条目（两个文件夹按快捷方式去重），不生成重复图标；\n" +
                 "「保留」：两项都保留，各自成为独立条目。",
-                "合并", () => CommitDrop(pendingPaths, pendingTab, true),
-                "保留", () => CommitDrop(pendingPaths, pendingTab, false)));
+                "合并", () => CommitDrop(pendingPaths, pendingTab, true, pendingModule),
+                "保留", () => CommitDrop(pendingPaths, pendingTab, false, pendingModule)));
         }
         else if (accepted.Count > 0)
         {
             _c.AddDroppedPaths(accepted, tabId, false);
-            AppLog.Drop($"已归入「{tabName}」：{accepted.Count} 项");
+            AppLog.Drop($"已归入模块「{moduleName}」的「{tabName}」：{accepted.Count} 项");
         }
 
         if (blocked.Count > 0)
@@ -1577,8 +1790,15 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>用户在同名询问中做出选择后，按合并 / 保留策略提交本次拖放。</summary>
-    private void CommitDrop(List<string> list, string? tabId, bool merge)
+    private void CommitDrop(List<string> list, string? tabId, bool merge, string? moduleId)
     {
+        // 对话框是异步队列，期间用户可能切了模块；提交前重新锁定原目标模块。
+        if (moduleId != null) _c.SetActiveModule(moduleId);
+        else if (tabId != null)
+        {
+            var owner = _c.ModuleOfTab(tabId);
+            if (owner != null) _c.SetActiveModule(owner.Id);
+        }
         if (list.Count > 0) _c.AddDroppedPaths(list, tabId, merge);
         AddToast(merge ? "同名项已合并" : "同名项已保留",
             merge ? "同名项已并入已有条目，未生成重复图标。" : "同名项作为独立条目保留，未做合并。",
@@ -1665,14 +1885,14 @@ public sealed partial class MainWindow : Window
         ShowNextDialog();
     }
 
-    /// <summary>一层 / 二层条目右键菜单：修改、删除。</summary>
-    private MenuFlyout ItemMenu(ShortcutItem item)
+    /// <summary>一层 / 二层条目右键菜单：修改、删除。mid 指定条目所属模块。</summary>
+    private MenuFlyout ItemMenu(ShortcutItem item, string mid)
     {
         var menu = new MenuFlyout();
         var edit = new MenuFlyoutItem { Text = "修改名称 / 路径 / 图标…" };
-        edit.Click += (_, _) => OpenEditor(item.Id);
+        edit.Click += (_, _) => OpenEditor(item.Id, mid);
         var del = new MenuFlyoutItem { Text = "移入待回收区…" };
-        del.Click += (_, _) => ConfirmDeleteItem(item.Id, item.DisplayName);
+        del.Click += (_, _) => ConfirmDeleteItem(item.Id, item.DisplayName, mid);
         menu.Items.Add(edit);
         menu.Items.Add(new MenuFlyoutSeparator());
         menu.Items.Add(del);
@@ -1680,47 +1900,53 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>标签页大类右键菜单：重命名、删除。</summary>
-    private MenuFlyout TabMenu(ShortcutTab tab)
+    private MenuFlyout TabMenu(ShortcutTab tab, string mid)
     {
         var menu = new MenuFlyout();
         var rename = new MenuFlyoutItem { Text = "重命名大类…" };
-        rename.Click += (_, _) => OpenTabEditor(tab.Id);
+        rename.Click += (_, _) => OpenTabEditor(tab.Id, mid);
         var del = new MenuFlyoutItem { Text = "移入待回收区…" };
-        del.Click += (_, _) => ConfirmDeleteTab(tab.Id, tab.Name);
+        del.Click += (_, _) => ConfirmDeleteTab(tab.Id, tab.Name, mid);
         menu.Items.Add(rename);
         menu.Items.Add(new MenuFlyoutSeparator());
         menu.Items.Add(del);
         return menu;
     }
 
-    private void ConfirmDeleteItem(string id, string name) =>
+    private void ConfirmDeleteItem(string id, string name, string mid) =>
         EnqueueDialog(new DialogSpec("移入待回收区",
             $"确定把「{name}」移入待回收区吗？\n\n将保留 {_c.RecycleRetentionDays} 天，期间可在标题栏「待回收区」还原；到期自动清除。磁盘文件不受影响。",
             "移入", () =>
             {
+                _c.SetActiveModule(mid);
                 bool ok = _c.DeleteItem(id);
                 AddToast(ok ? "已移入待回收区" : "操作失败",
                     ok ? $"「{name}」已暂存，{_c.RecycleRetentionDays} 天内可还原。" : "该条目可能已被移除。",
                     ok ? "ok" : "warn");
             }, "取消", null, true));
 
-    private void ConfirmDeleteTab(string id, string name) =>
+    private void ConfirmDeleteTab(string id, string name, string mid) =>
         EnqueueDialog(new DialogSpec("移入待回收区",
             $"确定把大类「{name}」及其全部条目移入待回收区吗？\n\n将整体保留 {_c.RecycleRetentionDays} 天，期间可一次性还原；到期自动清除。至少需要保留一个大类。",
             "移入", () =>
             {
+                _c.SetActiveModule(mid);
                 bool ok = _c.DeleteTab(id);
                 AddToast(ok ? "已移入待回收区" : "操作失败",
                     ok ? $"大类「{name}」已暂存，可整体还原。" : "至少需要保留一个标签页大类。",
                     ok ? "ok" : "warn");
             }, "取消", null, true));
 
-    private void OpenEditor(string id)
+    private void OpenEditor(string id, string mid)
     {
+        _c.SetActiveModule(mid);
         var item = _c.FindItem(id);
         if (item == null) return;
         _editId = id;
+        _editModuleId = mid;
         _editIsTab = false;
+        _editIsModule = false;
+        _editDeleteBtn.Visibility = Visibility.Visible;
         _editCaption.Text = item.Type == "folder" ? "修改文件夹聚合项" : "修改快捷方式";
         _editName.Text = item.DisplayName;
         _editTarget.Text = item.Type == "folder" ? (item.SourceDir ?? "") : item.Target;
@@ -1732,14 +1958,35 @@ public sealed partial class MainWindow : Window
         _editBox.Visibility = Visibility.Visible;
     }
 
-    private void OpenTabEditor(string id)
+    private void OpenTabEditor(string id, string mid)
     {
-        var tab = _c.Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == id);
+        _c.SetActiveModule(mid);
+        var tab = _c.ActiveModule().Tabs.FirstOrDefault(t => t.Id == id);
         if (tab == null) return;
         _editId = id;
+        _editModuleId = mid;
         _editIsTab = true;
+        _editIsModule = false;
+        _editDeleteBtn.Visibility = Visibility.Visible;
         _editCaption.Text = "重命名大类";
         _editName.Text = tab.Name;
+        _editTargetRow.Visibility = Visibility.Collapsed;
+        _editColorRow.Visibility = Visibility.Collapsed;
+        _editBox.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>v1.7：复用条目编辑器做模块重命名（无目标路径 / 颜色 / 删除按钮）。</summary>
+    private void OpenModuleEditor(string mid)
+    {
+        var m = _c.FindModule(mid);
+        if (m == null) return;
+        _editId = null;
+        _editModuleId = mid;
+        _editIsTab = false;
+        _editIsModule = true;
+        _editDeleteBtn.Visibility = Visibility.Collapsed;
+        _editCaption.Text = "重命名管理模块";
+        _editName.Text = m.Name;
         _editTargetRow.Visibility = Visibility.Collapsed;
         _editColorRow.Visibility = Visibility.Collapsed;
         _editBox.Visibility = Visibility.Visible;
@@ -1772,7 +2019,20 @@ public sealed partial class MainWindow : Window
 
     private void SaveEditor()
     {
+        if (_editIsModule)
+        {
+            bool renamed = _editModuleId != null && _c.RenameModule(_editModuleId, _editName.Text);
+            _editBox.Visibility = Visibility.Collapsed;
+            _editId = _editModuleId = null;
+            _editIsModule = false;
+            _editDeleteBtn.Visibility = Visibility.Visible;
+            AddToast(renamed ? "模块已改名" : "改名失败",
+                renamed ? "模块名称已保存，标题栏立即生效。" : "名称不能为空，或模块已被删除。",
+                renamed ? "ok" : "warn");
+            return;
+        }
         if (_editId == null) return;
+        if (_editModuleId != null) _c.SetActiveModule(_editModuleId);
         bool showTarget = _editTargetRow.Visibility == Visibility.Visible;
         bool showColor = _editColorRow.Visibility == Visibility.Visible;
         bool ok = _editIsTab
@@ -1781,7 +2041,7 @@ public sealed partial class MainWindow : Window
                 showTarget ? _editTarget.Text : null,
                 showColor ? _editPick : (int?)null);
         _editBox.Visibility = Visibility.Collapsed;
-        _editId = null;
+        _editId = _editModuleId = null;
         AddToast(ok ? "已保存修改" : "修改失败",
             ok ? "仅影响软件内显示与跳转目标，不改写源文件。" : "名称不能为空，或对应条目已被删除。",
             ok ? "ok" : "warn");
@@ -1791,6 +2051,7 @@ public sealed partial class MainWindow : Window
     {
         if (_editId == null) return;
         string id = _editId;
+        string? mid = _editModuleId;
         bool isTab = _editIsTab;
         string name = _editName.Text;
         EnqueueDialog(new DialogSpec("移入待回收区",
@@ -1799,9 +2060,10 @@ public sealed partial class MainWindow : Window
                 : $"确定把「{name}」移入待回收区吗？\n\n保留 {_c.RecycleRetentionDays} 天，期间可还原；到期自动清除。磁盘文件不受影响。",
             "移入", () =>
             {
+                if (mid != null) _c.SetActiveModule(mid);
                 bool ok = isTab ? _c.DeleteTab(id) : _c.DeleteItem(id);
                 _editBox.Visibility = Visibility.Collapsed;
-                _editId = null;
+                _editId = _editModuleId = null;
                 AddToast(ok ? "已移入待回收区" : "操作失败",
                     ok ? $"已暂存，{_c.RecycleRetentionDays} 天内可还原。" : "至少需保留一个大类，或条目已不存在。",
                     ok ? "ok" : "warn");
@@ -1828,11 +2090,18 @@ public sealed partial class MainWindow : Window
                 SyncWheels();
                 e.Handled = true;
             }
-            else if (_rightPanel != null && IsInside(_rightPanel, pos) && _c.ActiveFolder() != null)
+            // v1.7：二层滚轮按落点分发到对应模块，各模块的偏移互不干扰。
+            else
             {
-                _c.ScrollFolderBy(dir * Math.Max(1, _c.Config.Shortcuts.Grid2Cols));
-                SyncWheels();
-                e.Handled = true;
+                var r = _moduleRefs.FirstOrDefault(x => IsInside(x.RightPanel, pos));
+                var m = r == null ? null : _c.FindModule(r.Id);
+                if (r != null && m != null && _c.ActiveFolderOf(m) != null)
+                {
+                    _c.SetActiveModule(r.Id);
+                    _c.ScrollFolderBy(dir * Math.Max(1, _c.Config.Shortcuts.Grid2Cols));
+                    SyncWheels();
+                    e.Handled = true;
+                }
             }
             // 一层区域由 ScrollViewer 原生处理滚轮，此处不重复响应。
         }
@@ -1850,10 +2119,10 @@ public sealed partial class MainWindow : Window
         catch { return false; }
     }
 
-    /// <summary>滚动后把三个轮动条同步到当前偏移，避免滑块与实际窗口脱节。</summary>
+    /// <summary>滚动后把最近常用轮动条与各模块二层轮动条同步到各自偏移，避免滑块与实际窗口脱节。</summary>
     private void SyncWheels()
     {
-        if (_wheelV == null || _wheelH == null || _wheel2 == null) return;
+        if (_wheelV == null || _wheelH == null) return;
         _syncingWheels = true;
         try
         {
@@ -1863,8 +2132,13 @@ public sealed partial class MainWindow : Window
             _wheelH.Value = pR;
             int view = Math.Clamp(_c.Config.Shortcuts.Grid2Rows, 1, 5) *
                        Math.Clamp(_c.Config.Shortcuts.Grid2Cols, 1, 5);
-            double spanF = Math.Max(1, _c.FolderChildCount() - view);
-            _wheel2.Value = Math.Clamp(_c.T2Offset / spanF * 100.0, 0, 100);
+            foreach (var r in _moduleRefs)
+            {
+                var m = _c.FindModule(r.Id);
+                if (m == null || r.Wheel2 == null) continue;
+                double spanF = Math.Max(1, _c.FolderChildCountOf(m) - view);
+                r.Wheel2.Value = Math.Clamp(m.T2Offset / spanF * 100.0, 0, 100);
+            }
         }
         finally { _syncingWheels = false; }
     }

@@ -5,10 +5,10 @@ using DeskLite.Services;
 namespace DeskLite.Core;
 
 /// <summary>
-/// v1.6 隐藏诊断入口（--desklite-logic-test）：不创建窗口，直接验证待回收区、
-/// 7 天自动清除、根目录持久化、快捷方式真实图标提取与箭头角标隐藏的核心逻辑。
+/// v1.7 隐藏诊断入口（--desklite-logic-test）：不创建窗口，直接验证文件夹准入、同名合并、
+/// 编辑删除、滚轮、待回收区 7 天清除、真实图标与无角标图标，以及可拓展 N 个快捷方式管理模块。
 /// 通过 DESKLITE_CONFIG_DIR 把配置重定向到临时目录，绝不读写真实用户配置。
-/// 报告追加写入 %TEMP%\DeskLite_v1.6_selftest.log，不覆盖任何已有文件。
+/// 报告追加写入 %TEMP%\DeskLite_v1.7_selftest.log，不覆盖任何已有文件。
 /// </summary>
 public static class LogicSelfTest
 {
@@ -274,6 +274,113 @@ public static class LogicSelfTest
             ShortcutIconProvider.Clear();
             Check("不存在路径安全返回 null",
                 ShortcutIconProvider.GetPng(Path.Combine(root, "不存在.lnk")) == null);
+
+            // ============ v1.7：快捷方式管理可拓展 N 个同构模块 ============
+            var m0 = c.ActiveModule();
+            string m0Id = m0.Id;
+            int modules0 = c.Modules.Count;
+            Check("初始至少一个快捷方式管理模块",
+                modules0 >= 1 && c.ActiveModuleId == m0Id && m0.Tabs.Count >= 1);
+
+            string m1Id = c.AddModule(false);
+            var m1 = c.FindModule(m1Id);
+            Check("新增空白模块",
+                c.Modules.Count == modules0 + 1 && m1 != null && c.ActiveModuleId == m1Id);
+            Check("空白模块自带默认大类且无条目",
+                m1 != null && m1.Tabs.Count >= 1 && m1.Tabs.All(t => t.Items.Count == 0));
+
+            int m0Items = m0.Tabs.Sum(t => t.Items.Count);
+            c.AddDroppedPaths(new[] { single }, c.ActiveTabId, false);
+            Check("模块间数据隔离（新模块加条目不影响原模块）",
+                m1 != null && m1.Tabs.Sum(t => t.Items.Count) > 0 &&
+                m0.Tabs.Sum(t => t.Items.Count) == m0Items);
+
+            Check("模块改名", c.RenameModule(m1Id, "项目 A") &&
+                c.FindModule(m1Id)?.Name == "项目 A");
+            Check("模块改名拒绝空白名称", !c.RenameModule(m1Id, "   ") &&
+                c.FindModule(m1Id)?.Name == "项目 A");
+
+            string m2Id = c.DuplicateModule(m1Id);
+            var m2 = c.FindModule(m2Id);
+            Check("复制模块连全部大类与条目",
+                c.Modules.Count == modules0 + 2 && m2 != null &&
+                m2!.Tabs.Sum(t => t.Items.Count) == m1!.Tabs.Sum(t => t.Items.Count));
+            Check("复制模块内部 Id 全部重新生成",
+                m2 != null && m2.Id != m1?.Id &&
+                m2.Tabs.All(t => m1!.Tabs.All(x => x.Id != t.Id)));
+            c.SetActiveModule(m2Id);
+            c.AddDroppedPaths(new[] { single }, c.ActiveTabId, false);
+            Check("副本与原模块互不影响",
+                m2 != null && m1 != null &&
+                m2.Tabs.Sum(t => t.Items.Count) == m1.Tabs.Sum(t => t.Items.Count) + 1);
+
+            int idx2 = c.Modules.Select(m => m.Id).ToList().IndexOf(m2Id);
+            c.MoveModule(m2Id, -1);
+            Check("模块上移",
+                c.Modules.Select(m => m.Id).ToList().IndexOf(m2Id) == Math.Max(0, idx2 - 1));
+            c.MoveModule(m2Id, 1);
+            Check("模块下移",
+                c.Modules.Select(m => m.Id).ToList().IndexOf(m2Id) == idx2);
+
+            // 各模块视图状态独立：m1 打开文件夹并滚动，m0 的打开状态与偏移保持自己的值
+            c.SetActiveModule(m1Id);
+            c.AddDroppedPaths(new[] { pure }, c.ActiveTabId, false);
+            var m1Folder = m1!.Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Type == "folder");
+            if (m1Folder != null)
+            {
+                for (int i = 0; i < 15; i++)
+                    m1Folder.Children.Add(new ShortcutItem
+                    {
+                        Type = "link", Name = "M" + i, Target = Path.Combine(root, "m" + i + ".lnk")
+                    });
+                c.OpenShortcut(m1Folder);
+                c.ScrollFolderBy(3);
+                Check("模块视图状态独立（二层打开与滚轮偏移落在各自模块）",
+                    m1.T2Offset == 3 && c.ActiveFolderOf(m1)?.Id == m1Folder.Id &&
+                    m0.T2Offset == 0 && m0.ActiveFolderId != m1Folder.Id);
+            }
+            else Check("存在可测试模块视图状态的 folder", false);
+
+            int recycleBeforeModule = c.RecycleCount;
+            bool modDeleted = c.DeleteModule(m2Id);
+            var mrec = c.RecycleEntries.Last();
+            Check("删除模块 → 待回收区 kind=module",
+                modDeleted && c.Modules.Count == modules0 + 1 &&
+                c.RecycleCount == recycleBeforeModule + 1 &&
+                mrec.Kind == "module" && mrec.Module != null);
+            Check("模块回收记录保存模块名与大类快照",
+                !string.IsNullOrWhiteSpace(mrec.ModuleName) &&
+                mrec.Module!.Tabs.Count > 0 &&
+                File.Exists(Path.Combine(c.RecycleDir, mrec.Id + ".json")));
+            c.SaveNow();
+            string manifest = File.ReadAllText(Path.Combine(c.DataRootDir, "快捷方式清单.json"));
+            Check("快捷方式清单按模块分组输出",
+                manifest.Contains("\"modules\"") && manifest.Contains("项目 A"));
+            bool modRestored = c.RestoreRecycle(mrec.Id);
+            Check("还原整个模块（含全部大类）",
+                modRestored && c.Modules.Count == modules0 + 2 &&
+                c.FindModule(m2Id) != null &&
+                c.RecycleCount == recycleBeforeModule);
+
+            // 至少保留一个模块
+            while (c.Modules.Count > 1) c.DeleteModule(c.Modules.Last().Id);
+            Check("至少保留一个管理模块",
+                c.Modules.Count == 1 && !c.DeleteModule(c.Modules[0].Id));
+
+            // 旧配置迁移：v1.6 及更早只有顶层 tabs，应自动包装成第一个模块
+            string legacyDir = Path.Combine(root, "legacy_config");
+            Directory.CreateDirectory(legacyDir);
+            File.WriteAllText(Path.Combine(legacyDir, "config.json"),
+                "{\"schema\":2,\"shortcuts\":{\"tabs\":[{\"id\":\"legacyA\",\"name\":\"旧大类\",\"items\":[]}],\"grid2Rows\":3,\"grid2Cols\":3}}");
+            Environment.SetEnvironmentVariable("DESKLITE_CONFIG_DIR", legacyDir);
+            var legacy = new AppController();
+            Check("旧版顶层 tabs 自动迁移为第一个模块",
+                legacy.Modules.Count == 1 && legacy.Modules[0].Tabs.Count == 1 &&
+                legacy.Modules[0].Tabs[0].Name == "旧大类");
+            Check("迁移后兼容字段 Tabs 仍可回显",
+                legacy.Config.Shortcuts.Tabs.Count == 1 &&
+                legacy.ActiveTabId == "legacyA");
+            Environment.SetEnvironmentVariable("DESKLITE_CONFIG_DIR", cfgDir);
         }
         catch (Exception ex)
         {
@@ -287,7 +394,7 @@ public static class LogicSelfTest
         string report = sb + $"合计：PASS {pass} / FAIL {fail}\r\n";
         try
         {
-            string log = Path.Combine(Path.GetTempPath(), "DeskLite_v1.6_selftest.log");
+            string log = Path.Combine(Path.GetTempPath(), "DeskLite_v1.7_selftest.log");
             File.AppendAllText(log, $"===== {DateTime.Now:yyyy-MM-dd HH:mm:ss} =====\r\n" + report + "\r\n");
         }
         catch { /* 报告写失败不影响自测结论 */ }

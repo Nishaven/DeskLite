@@ -5,7 +5,8 @@ namespace DeskLite.Models;
 /// <summary>配置根对象，对应 %APPDATA%\DeskLite\config.json。</summary>
 public sealed class AppConfig
 {
-    public int Schema { get; set; } = 2;
+    /// <summary>v1.7 起 Schema=3：快捷方式管理升级为可拓展的 N 个同构模块。</summary>
+    public int Schema { get; set; } = 3;
     public IconConfig Icon { get; set; } = new();
     public RecentConfig Recent { get; set; } = new();
     public ShortcutConfig Shortcuts { get; set; } = new();
@@ -25,18 +26,22 @@ public sealed class RecycleConfig
 
 /// <summary>
 /// 一条待回收记录。Item 保存一层条目或二层子项的完整快照，Tab 保存整个大类的快照，
-/// 因此还原时能精确回到原大类 / 原父文件夹 / 原位置。
+/// v1.7 起 Module 保存整个快捷方式管理模块的快照，因此还原时能精确回到原模块 /
+/// 原大类 / 原父文件夹 / 原位置。
 /// </summary>
 public sealed class RecycleEntry
 {
     public string Id { get; set; } = ShortcutTab.NewId();
-    /// <summary>item = 一层条目；child = 二层子项；tab = 整个大类。</summary>
+    /// <summary>item = 一层条目；child = 二层子项；tab = 整个大类；module = 整个模块。</summary>
     public string Kind { get; set; } = "item";
     public string Name { get; set; } = "";
     /// <summary>删除时刻，UTC Unix 毫秒。</summary>
     public long DeletedAt { get; set; }
     public string TabId { get; set; } = "";
     public string TabName { get; set; } = "";
+    /// <summary>v1.7：该记录所属模块；旧版本记录为空，还原时降级到第一个模块。</summary>
+    public string? ModuleId { get; set; }
+    public string? ModuleName { get; set; }
     public string? ParentId { get; set; }
     public string? ParentName { get; set; }
     /// <summary>在原列表中的位置，还原时尽量插回。</summary>
@@ -45,9 +50,17 @@ public sealed class RecycleEntry
     public string? SourcePath { get; set; }
     public ShortcutItem? Item { get; set; }
     public ShortcutTab? Tab { get; set; }
+    /// <summary>v1.7：Kind=module 时保存整个模块（含全部大类与条目）。</summary>
+    public ShortcutModule? Module { get; set; }
 
     [JsonIgnore]
-    public string KindLabel => Kind switch { "tab" => "大类", "child" => "二层子项", _ => "一层条目" };
+    public string KindLabel => Kind switch
+    {
+        "module" => "管理模块",
+        "tab" => "大类",
+        "child" => "二层子项",
+        _ => "一层条目"
+    };
 }
 
 /// <summary>需求 0：图标大小与同步参数。</summary>
@@ -89,16 +102,61 @@ public sealed class RecentItem
     public int ColorIndex { get; set; }
 }
 
-/// <summary>需求 2 / 2.1 / 2.2：快捷方式管理。</summary>
+/// <summary>需求 2 / 2.1 / 2.2：快捷方式管理。v1.7 起支持在其下拓展 N 个同构模块。</summary>
 public sealed class ShortcutConfig
 {
-    public List<ShortcutTab> Tabs { get; set; } = new();
+    /// <summary>
+    /// v1.7：N 个功能相同、可独立命名的「快捷方式管理」模块，垂直堆叠在主窗口内。
+    /// 每个模块持有自己的大类树与交互状态（当前大类 / 打开的二层文件夹 / 二层滚轮偏移），彼此完全隔离。
+    /// 全局设置（Grid2Rows / Grid2Cols / IconRule / AutoOpenFirst）由所有模块共享，保证「功能相同」。
+    /// 声明顺序必须早于 Tabs：反序列化新配置时先装载 Modules，随后回显的 Tabs 才不会误触发迁移。
+    /// </summary>
+    public List<ShortcutModule> Modules { get; set; } = new();
+
+    /// <summary>
+    /// 兼容字段：v1.6 及更早的配置只有顶层 tabs，反序列化时由 setter 自动迁移成第一个模块；
+    /// 写出时回显第一个模块的大类，使旧版本仍能读回主模块数据。
+    /// 运行时代码一律通过 Modules / AppController 访问，不依赖本属性。
+    /// </summary>
+    public List<ShortcutTab> Tabs
+    {
+        get => Modules.FirstOrDefault()?.Tabs ?? _legacyTabs;
+        set
+        {
+            _legacyTabs = value ?? new List<ShortcutTab>();
+            if (Modules.Count == 0)
+                Modules.Add(new ShortcutModule { Tabs = _legacyTabs });
+        }
+    }
+
+    [JsonIgnore] private List<ShortcutTab> _legacyTabs = new();
+
     public int Grid2Rows { get; set; } = 3;
     public int Grid2Cols { get; set; } = 3;
     /// <summary>alpha-first = 按名称升序取第一项图标；first = 文件系统顺序第一项。</summary>
     public string IconRule { get; set; } = "alpha-first";
     /// <summary>首次拖入文件夹自动打开二级窗口。</summary>
     public bool AutoOpenFirst { get; set; } = true;
+}
+
+/// <summary>
+/// v1.7：一个完整的「快捷方式管理」模块实例。可复制 N 份、独立命名、独立维护大类与条目。
+/// ActiveTabId / ActiveFolderId / T2Offset 是该模块自己的视图状态，随窗口记忆一起持久化。
+/// </summary>
+public sealed class ShortcutModule
+{
+    public string Id { get; set; } = NewId();
+    /// <summary>模块显示名，用户可在标题栏「改名」中修改。</summary>
+    public string Name { get; set; } = "快捷方式管理";
+    public List<ShortcutTab> Tabs { get; set; } = new();
+    /// <summary>该模块当前选中的一层大类。</summary>
+    public string ActiveTabId { get; set; } = "";
+    /// <summary>该模块当前打开的二层 folder；null 表示未打开。</summary>
+    public string? ActiveFolderId { get; set; }
+    /// <summary>该模块二层收纳的滚轮偏移。</summary>
+    public int T2Offset { get; set; }
+
+    public static string NewId() => Guid.NewGuid().ToString("N")[..8];
 }
 
 public sealed class ShortcutTab

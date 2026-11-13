@@ -261,7 +261,7 @@ public static class ShortcutIconProvider
                 {
                     biSize = (uint)Marshal.SizeOf<BITMAPINFOHEADER>(),
                     biWidth = w,
-                    biHeight = -h,          // top-down 请求
+                    biHeight = h,           // v1.6.1 修复：请求自底向上（正高度，所有驱动保证支持）
                     biPlanes = 1,
                     biBitCount = 32,
                     biCompression = 0       // BI_RGB
@@ -272,13 +272,16 @@ public static class ShortcutIconProvider
                 finally { ReleaseDC(IntPtr.Zero, hdc); }
                 if (lines == 0) return null;
 
-                // 图标 color bitmap 为自下而上存储时按行翻转，与实测口径一致。
-                bool flip = bm.bmHeight > 0;
+                // v1.6.1 修复「图标上下颠倒 180°」：正高度 GetDIBits 返回自底向上行序
+                // （缓冲区第 0 行 = 图像最底部一行），PNG 需要自顶向下，故无条件按行翻转一次。
+                // v1.6 的缺陷：请求了 top-down（biHeight = -h，缓冲区已是正确方向），
+                // 却又按 bm.bmHeight > 0 再翻转一遍，等于翻了两次，结果上下颠倒。
+                // 现改为「正高度请求 + 无条件翻转一次」，不再依赖驱动对负高度请求的处理差异。
                 var rgba = new byte[w * h * 4];
                 long alphaSum = 0;
                 for (int y = 0; y < h; y++)
                 {
-                    int srcRow = (flip ? h - 1 - y : y) * w * 4;
+                    int srcRow = (h - 1 - y) * w * 4;
                     int dstRow = y * w * 4;
                     for (int x = 0; x < w; x++)
                     {

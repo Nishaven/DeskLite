@@ -15,7 +15,8 @@ public sealed class AppController
     private int _lastObservedPx;
     private int _candidatePx;
     private int _recentOffset;
-    private int _t2Offset;
+    /// <summary>v1.7：当前焦点模块。交互（点击/拖放/滚轮）前 UI 会先 SetActiveModule。</summary>
+    private string _activeModuleId = "";
     private DateTime _phaseStart = DateTime.UtcNow;
     private DateTime _lastPoll = DateTime.UtcNow;
     private DateTime _lastRecycleCheck = DateTime.UtcNow;
@@ -29,10 +30,24 @@ public sealed class AppController
     public double ConfirmRemainingMs { get; private set; }
     public double ConfirmTotalMs => Math.Max(1, Config.Icon.ConfirmMs);
     public string Status { get; private set; } = "空闲";
-    public string ActiveTabId { get; private set; } = "";
-    public string? ActiveFolderId { get; private set; }
+
+    // v1.7：以下三个视图状态不再全局单例，而是落在各自的模块上，模块之间互不干扰。
+    public string ActiveTabId
+    {
+        get => ActiveModule().ActiveTabId;
+        private set => ActiveModule().ActiveTabId = value;
+    }
+    public string? ActiveFolderId
+    {
+        get => ActiveModule().ActiveFolderId;
+        private set => ActiveModule().ActiveFolderId = value;
+    }
     public int RecentOffset => _recentOffset;
-    public int T2Offset => _t2Offset;
+    public int T2Offset
+    {
+        get => ActiveModule().T2Offset;
+        private set => ActiveModule().T2Offset = value;
+    }
 
     /// <summary>数据 / 布局变化，需要重绘网格。</summary>
     public event Action? Changed;
@@ -71,7 +86,11 @@ public sealed class AppController
             _store.RequestSave();
         }
         PendingOldPx = AppPx;
-        ActiveTabId = cfg.Shortcuts.Tabs.FirstOrDefault()?.Id ?? "";
+        // v1.7：ConfigStore 已保证至少一个模块；先校准每个模块的当前大类，再选中第一个模块。
+        foreach (var m in cfg.Shortcuts.Modules)
+            if (m.Tabs.Count == 0 || m.Tabs.All(t => t.Id != m.ActiveTabId))
+                m.ActiveTabId = m.Tabs.FirstOrDefault()?.Id ?? "";
+        _activeModuleId = cfg.Shortcuts.Modules[0].Id;
 
         // v1.5 改善 1：启动即清理过期项（此时 Toast 尚未订阅，故不通知），
         // 并清掉配置里已不存在记录的孤立快照文件。
@@ -287,21 +306,193 @@ public sealed class AppController
         return list;
     }
 
+    // ---------- v1.7：快捷方式管理模块（可在下方复制 N 份） ----------
+
+    /// <summary>活动模块的大类列表。所有原有业务方法经此访问，天然落在当前模块。</summary>
+    private List<ShortcutTab> Tabs => ActiveModule().Tabs;
+
+    public IReadOnlyList<ShortcutModule> Modules => Config.Shortcuts.Modules;
+    public string ActiveModuleId => _activeModuleId;
+    public int Grid2View =>
+        Math.Clamp(Config.Shortcuts.Grid2Rows, 1, 5) * Math.Clamp(Config.Shortcuts.Grid2Cols, 1, 5);
+
+    public ShortcutModule ActiveModule() =>
+        Config.Shortcuts.Modules.FirstOrDefault(m => m.Id == _activeModuleId)
+        ?? Config.Shortcuts.Modules[0];
+
+    public ShortcutModule? FindModule(string id) =>
+        Config.Shortcuts.Modules.FirstOrDefault(m => m.Id == id);
+
+    /// <summary>切换焦点模块；UI 在任何模块内交互前先调用，保证业务方法作用于正确模块。</summary>
+    public void SetActiveModule(string id)
+    {
+        if (_activeModuleId == id) return;
+        if (!Config.Shortcuts.Modules.Any(m => m.Id == id)) return;
+        _activeModuleId = id;
+        Changed?.Invoke();
+    }
+
+    private void EnsureActiveModuleValid()
+    {
+        if (Config.Shortcuts.Modules.Count == 0)
+            Config.Shortcuts.Modules.Add(NewBlankModule());
+        if (!Config.Shortcuts.Modules.Any(m => m.Id == _activeModuleId))
+            _activeModuleId = Config.Shortcuts.Modules[0].Id;
+    }
+
+    /// <summary>还原回收记录时静默定位到原模块，不触发重绘（后面会统一 SaveChanged）。</summary>
+    private void SwitchModuleSilently(string? id)
+    {
+        if (!string.IsNullOrWhiteSpace(id) && Config.Shortcuts.Modules.Any(m => m.Id == id))
+            _activeModuleId = id;
+    }
+
+    // 按模块的纯查询：UI 为每个模块独立渲染，不依赖「当前焦点模块」。
+    public ShortcutTab ActiveTabOf(ShortcutModule m) =>
+        m.Tabs.FirstOrDefault(t => t.Id == m.ActiveTabId) ?? m.Tabs[0];
+
+    public ShortcutItem? ActiveFolderOf(ShortcutModule m) =>
+        m.ActiveFolderId == null ? null :
+        m.Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Id == m.ActiveFolderId && i.Type == "folder");
+
+    public List<ShortcutItem?> FolderWindowFor(ShortcutModule m)
+    {
+        var folder = ActiveFolderOf(m);
+        int view = Grid2View;
+        if (folder == null) return Enumerable.Repeat<ShortcutItem?>(null, view).ToList();
+        int span = Math.Max(0, folder.Children.Count - view);
+        m.T2Offset = Math.Clamp(m.T2Offset, 0, span);
+        var list = folder.Children.Skip(m.T2Offset).Take(view).Cast<ShortcutItem?>().ToList();
+        while (list.Count < view) list.Add(null);
+        return list;
+    }
+
+    public ShortcutTab? FindTab(string id) =>
+        Config.Shortcuts.Modules.SelectMany(m => m.Tabs).FirstOrDefault(t => t.Id == id);
+
+    /// <summary>按大类 Id 反查所属模块，供拖放落点定位。</summary>
+    public ShortcutModule? ModuleOfTab(string tabId) =>
+        Config.Shortcuts.Modules.FirstOrDefault(m => m.Tabs.Any(t => t.Id == tabId));
+
+    private static ShortcutModule NewBlankModule(string? name = null)
+    {
+        var m = new ShortcutModule { Name = name ?? "快捷方式管理" };
+        foreach (var n in new[] { "工作", "开发", "娱乐", "素材", "临时" })
+            m.Tabs.Add(new ShortcutTab { Name = n });
+        m.ActiveTabId = m.Tabs[0].Id;
+        return m;
+    }
+
+    private static ShortcutItem CloneItem(ShortcutItem i) => new()
+    {
+        Name = i.Name, Target = i.Target, Type = i.Type, SourceDir = i.SourceDir,
+        IconOverride = i.IconOverride, NameOverride = i.NameOverride,
+        AutoOpenedOnce = i.AutoOpenedOnce, ColorIndex = i.ColorIndex,
+        Children = i.Children.Select(CloneItem).ToList()
+    };
+
+    private static ShortcutModule CloneModule(ShortcutModule src, string? name = null)
+    {
+        var copy = new ShortcutModule { Name = name ?? src.Name + " · 副本" };
+        foreach (var t in src.Tabs)
+        {
+            var nt = new ShortcutTab { Name = t.Name };
+            foreach (var i in t.Items) nt.Items.Add(CloneItem(i));
+            copy.Tabs.Add(nt);
+        }
+        copy.ActiveTabId = copy.Tabs.FirstOrDefault()?.Id ?? "";
+        // 视图状态不复制：新模块从「未打开二层 / 滚轮归零」开始。
+        return copy;
+    }
+
+    /// <summary>
+    /// 新增模块。copyFrom=true 时以 sourceId（默认当前模块）为模板连全部大类与条目复制，
+    /// 内部 Id 全部重新生成，之后两个模块互不影响；否则创建带 5 个默认大类的空白模块。
+    /// </summary>
+    public string AddModule(bool copyFrom, string? sourceId = null)
+    {
+        var src = sourceId != null ? FindModule(sourceId) : ActiveModule();
+        var m = copyFrom && src != null
+            ? CloneModule(src)
+            : NewBlankModule($"快捷方式管理 {Config.Shortcuts.Modules.Count + 1}");
+        Config.Shortcuts.Modules.Add(m);
+        _activeModuleId = m.Id;
+        SaveChanged();
+        return m.Id;
+    }
+
+    /// <summary>以指定模块为模板复制一份并插入到其后。</summary>
+    public string DuplicateModule(string id)
+    {
+        var src = FindModule(id);
+        if (src == null) return "";
+        var copy = CloneModule(src);
+        int at = Math.Clamp(Config.Shortcuts.Modules.IndexOf(src) + 1, 0, Config.Shortcuts.Modules.Count);
+        Config.Shortcuts.Modules.Insert(at, copy);
+        _activeModuleId = copy.Id;
+        SaveChanged();
+        return copy.Id;
+    }
+
+    public bool RenameModule(string id, string name)
+    {
+        var m = FindModule(id);
+        if (m == null || string.IsNullOrWhiteSpace(name)) return false;
+        m.Name = name.Trim();
+        SaveChanged();
+        return true;
+    }
+
+    /// <summary>上移 / 下移：delta 为 -1 或 +1，越界自动钳制。</summary>
+    public void MoveModule(string id, int delta)
+    {
+        var list = Config.Shortcuts.Modules;
+        int i = list.FindIndex(m => m.Id == id);
+        if (i < 0) return;
+        int j = Math.Clamp(i + delta, 0, list.Count - 1);
+        if (i == j) return;
+        (list[i], list[j]) = (list[j], list[i]);
+        SaveChanged();
+    }
+
+    /// <summary>删除整个模块（连同全部大类与条目）→ 待回收区，7 天内可整体还原；至少保留一个。</summary>
+    public bool DeleteModule(string id)
+    {
+        if (Config.Shortcuts.Modules.Count <= 1)
+        {
+            ToastRequested?.Invoke("无法删除模块", "至少需要保留一个「快捷方式管理」模块。", "warn");
+            return false;
+        }
+        var m = FindModule(id);
+        if (m == null) return false;
+        AddToRecycle(new RecycleEntry
+        {
+            Kind = "module", Name = m.Name,
+            DeletedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            Index = Config.Shortcuts.Modules.IndexOf(m),
+            ModuleId = m.Id, ModuleName = m.Name, Module = m
+        });
+        Config.Shortcuts.Modules.Remove(m);
+        EnsureActiveModuleValid();
+        SaveChanged();
+        return true;
+    }
+
     // ---------- 需求 2 ----------
 
     public ShortcutTab ActiveTab() =>
-        Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == ActiveTabId) ?? Config.Shortcuts.Tabs[0];
+        Tabs.FirstOrDefault(t => t.Id == ActiveTabId) ?? Tabs[0];
 
     public ShortcutItem? ActiveFolder() =>
         ActiveFolderId == null ? null :
-        Config.Shortcuts.Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Id == ActiveFolderId && i.Type == "folder");
+        Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Id == ActiveFolderId && i.Type == "folder");
 
     public void SetActiveTab(string id) { ActiveTabId = id; Changed?.Invoke(); }
 
     public void AddTab(string? name = null)
     {
-        var tab = new ShortcutTab { Name = name ?? $"新大类 {Config.Shortcuts.Tabs.Count + 1}" };
-        Config.Shortcuts.Tabs.Add(tab);
+        var tab = new ShortcutTab { Name = name ?? $"新大类 {Tabs.Count + 1}" };
+        Tabs.Add(tab);
         ActiveTabId = tab.Id;
         SaveChanged();
     }
@@ -311,7 +502,7 @@ public sealed class AppController
         if (item.Type == "folder")
         {
             ActiveFolderId = item.Id;
-            _t2Offset = 0;
+            T2Offset = 0;
             Changed?.Invoke();
             return;
         }
@@ -319,12 +510,12 @@ public sealed class AppController
         ShortcutService.Launch(item.Target);
     }
 
-    public void CloseFolder() { ActiveFolderId = null; _t2Offset = 0; Changed?.Invoke(); }
+    public void CloseFolder() { ActiveFolderId = null; T2Offset = 0; Changed?.Invoke(); }
 
     /// <summary>2.2 的「…」：覆盖显示名称与显示图标，不改写源文件夹。</summary>
     public void ApplyFolderSettings(string id, string? name, int? iconIndex)
     {
-        var item = Config.Shortcuts.Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Id == id);
+        var item = Tabs.SelectMany(t => t.Items).FirstOrDefault(i => i.Id == id);
         if (item == null) return;
         item.NameOverride = string.IsNullOrWhiteSpace(name) ? null : name.Trim();
         item.IconOverride = iconIndex;
@@ -338,19 +529,7 @@ public sealed class AppController
         return Palette.Initial(ShortcutService.DefaultIconName(folder, Config.Shortcuts.IconRule) ?? folder.DisplayName);
     }
 
-    public List<ShortcutItem?> FolderWindow()
-    {
-        var folder = ActiveFolder();
-        int rows = Math.Clamp(Config.Shortcuts.Grid2Rows, 1, 5);
-        int cols = Math.Clamp(Config.Shortcuts.Grid2Cols, 1, 5);
-        int view = rows * cols;
-        if (folder == null) return Enumerable.Repeat<ShortcutItem?>(null, view).ToList();
-        int span = Math.Max(0, folder.Children.Count - view);
-        _t2Offset = Math.Clamp(_t2Offset, 0, span);
-        var list = folder.Children.Skip(_t2Offset).Take(view).Cast<ShortcutItem?>().ToList();
-        while (list.Count < view) list.Add(null);
-        return list;
-    }
+    public List<ShortcutItem?> FolderWindow() => FolderWindowFor(ActiveModule());
 
     public void SetFolderPosition(double p)
     {
@@ -358,7 +537,7 @@ public sealed class AppController
         if (folder == null) return;
         int view = Math.Clamp(Config.Shortcuts.Grid2Rows, 1, 5) * Math.Clamp(Config.Shortcuts.Grid2Cols, 1, 5);
         int span = Math.Max(0, folder.Children.Count - view);
-        _t2Offset = Math.Clamp((int)Math.Round(p * span), 0, span);
+        T2Offset = Math.Clamp((int)Math.Round(p * span), 0, span);
         FolderViewChanged?.Invoke();
     }
 
@@ -379,19 +558,20 @@ public sealed class AppController
         if (folder == null) return;
         int view = Math.Clamp(Config.Shortcuts.Grid2Rows, 1, 5) * Math.Clamp(Config.Shortcuts.Grid2Cols, 1, 5);
         int span = Math.Max(0, folder.Children.Count - view);
-        int next = Math.Clamp(_t2Offset + items, 0, span);
-        if (next == _t2Offset) return;
-        _t2Offset = next;
+        int next = Math.Clamp(T2Offset + items, 0, span);
+        if (next == T2Offset) return;
+        T2Offset = next;
         FolderViewChanged?.Invoke();
     }
 
     public int FolderChildCount() => ActiveFolder()?.Children.Count ?? 0;
+    public int FolderChildCountOf(ShortcutModule m) => ActiveFolderOf(m)?.Children.Count ?? 0;
 
     // ---------- v1.4 功能完善 1 / 2 / 3 ----------
 
     private ShortcutTab ResolveTab(string? targetTabId) =>
-        Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == (targetTabId ?? ActiveTabId))
-        ?? Config.Shortcuts.Tabs[0];
+        Tabs.FirstOrDefault(t => t.Id == (targetTabId ?? ActiveTabId))
+        ?? Tabs[0];
 
     private static bool SameName(string? a, string? b) =>
         string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
@@ -527,7 +707,7 @@ public sealed class AppController
 
     /// <summary>功能完善 3：按 Id 查找一层条目或二层子项。</summary>
     public ShortcutItem? FindItem(string id) =>
-        Config.Shortcuts.Tabs
+        Tabs
             .SelectMany(t => t.Items.SelectMany(i => new[] { i }.Concat(i.Children)))
             .FirstOrDefault(i => i.Id == id);
 
@@ -559,7 +739,7 @@ public sealed class AppController
     public bool DeleteItem(string id)
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        foreach (var tab in Config.Shortcuts.Tabs)
+        foreach (var tab in Tabs)
         {
             var hit = tab.Items.FirstOrDefault(i => i.Id == id);
             if (hit != null)
@@ -573,7 +753,7 @@ public sealed class AppController
                     Item = hit
                 });
                 tab.Items.Remove(hit);
-                if (ActiveFolderId == id) { ActiveFolderId = null; _t2Offset = 0; }
+                if (ActiveFolderId == id) { ActiveFolderId = null; T2Offset = 0; }
                 SaveChanged();
                 return true;
             }
@@ -591,7 +771,7 @@ public sealed class AppController
                 });
                 folder.Children.Remove(child);
                 int view = Math.Clamp(Config.Shortcuts.Grid2Rows, 1, 5) * Math.Clamp(Config.Shortcuts.Grid2Cols, 1, 5);
-                _t2Offset = Math.Clamp(_t2Offset, 0, Math.Max(0, folder.Children.Count - view));
+                T2Offset = Math.Clamp(T2Offset, 0, Math.Max(0, folder.Children.Count - view));
                 SaveChanged();
                 return true;
             }
@@ -602,7 +782,7 @@ public sealed class AppController
     /// <summary>功能完善 3：重命名一层标签页大类。</summary>
     public bool RenameTab(string id, string name)
     {
-        var tab = Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == id);
+        var tab = Tabs.FirstOrDefault(t => t.Id == id);
         if (tab == null || string.IsNullOrWhiteSpace(name)) return false;
         tab.Name = name.Trim();
         SaveChanged();
@@ -612,23 +792,23 @@ public sealed class AppController
     /// <summary>v1.5：删除大类（至少保留一个）→ 整个大类进待回收区，还原时整体恢复。</summary>
     public bool DeleteTab(string id)
     {
-        if (Config.Shortcuts.Tabs.Count <= 1)
+        if (Tabs.Count <= 1)
         {
             ToastRequested?.Invoke("无法删除大类", "至少需要保留一个标签页大类。", "warn");
             return false;
         }
-        var tab = Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == id);
+        var tab = Tabs.FirstOrDefault(t => t.Id == id);
         if (tab == null) return false;
         AddToRecycle(new RecycleEntry
         {
             Kind = "tab", Name = tab.Name, DeletedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            TabId = tab.Id, TabName = tab.Name, Index = Config.Shortcuts.Tabs.IndexOf(tab),
+            TabId = tab.Id, TabName = tab.Name, Index = Tabs.IndexOf(tab),
             Tab = tab
         });
         var owned = tab.Items.Select(i => i.Id).ToHashSet();
-        if (ActiveFolderId != null && owned.Contains(ActiveFolderId)) { ActiveFolderId = null; _t2Offset = 0; }
-        Config.Shortcuts.Tabs.Remove(tab);
-        if (ActiveTabId == id) ActiveTabId = Config.Shortcuts.Tabs[0].Id;
+        if (ActiveFolderId != null && owned.Contains(ActiveFolderId)) { ActiveFolderId = null; T2Offset = 0; }
+        Tabs.Remove(tab);
+        if (ActiveTabId == id) ActiveTabId = Tabs[0].Id;
         SaveChanged();
         return true;
     }
@@ -657,6 +837,12 @@ public sealed class AppController
 
     private void AddToRecycle(RecycleEntry e)
     {
+        // v1.7：无论删除的是条目、大类还是模块，都记下所属模块，还原时精确归位。
+        if (string.IsNullOrWhiteSpace(e.ModuleId))
+        {
+            e.ModuleId = ActiveModule().Id;
+            e.ModuleName = ActiveModule().Name;
+        }
         Config.Recycle.Entries.Add(e);
         _store.WriteRecycleSnapshot(e);
     }
@@ -699,23 +885,36 @@ public sealed class AppController
         var e = Config.Recycle.Entries.FirstOrDefault(x => x.Id == entryId);
         if (e == null) return false;
 
-        if (e.Kind == "tab" && e.Tab != null)
+        if (e.Kind == "module" && e.Module != null)
         {
+            var m = e.Module;
+            m.Tabs ??= new List<ShortcutTab>();
+            if (Config.Shortcuts.Modules.Any(x => x.Id == m.Id)) ReassignModuleIds(m);
+            if (m.Tabs.Count == 0) m.Tabs.Add(new ShortcutTab { Name = "工作" });
+            if (m.Tabs.All(t => t.Id != m.ActiveTabId)) m.ActiveTabId = m.Tabs[0].Id;
+            Config.Shortcuts.Modules.Insert(
+                Math.Clamp(e.Index, 0, Config.Shortcuts.Modules.Count), m);
+            _activeModuleId = m.Id;
+        }
+        else if (e.Kind == "tab" && e.Tab != null)
+        {
+            SwitchModuleSilently(e.ModuleId);
             var tab = e.Tab;
             tab.Items ??= new List<ShortcutItem>();
-            if (Config.Shortcuts.Tabs.Any(t => t.Id == tab.Id)) ReassignTabIds(tab);
-            Config.Shortcuts.Tabs.Insert(Math.Clamp(e.Index, 0, Config.Shortcuts.Tabs.Count), tab);
+            if (Tabs.Any(t => t.Id == tab.Id)) ReassignTabIds(tab);
+            Tabs.Insert(Math.Clamp(e.Index, 0, Tabs.Count), tab);
             ActiveTabId = tab.Id;
         }
         else if (e.Item != null)
         {
+            SwitchModuleSilently(e.ModuleId);
             var item = e.Item;
             item.Children ??= new List<ShortcutItem>();
             if (FindItem(item.Id) != null) ReassignItemIds(item);
 
             if (e.Kind == "child" && !string.IsNullOrWhiteSpace(e.ParentId))
             {
-                var parent = Config.Shortcuts.Tabs.SelectMany(t => t.Items)
+                var parent = Tabs.SelectMany(t => t.Items)
                     .FirstOrDefault(i => i.Id == e.ParentId && i.Type == "folder");
                 if (parent != null)
                 {
@@ -758,7 +957,7 @@ public sealed class AppController
 
     private void AddAsTopLevel(ShortcutItem item, string tabId, int index)
     {
-        var tab = Config.Shortcuts.Tabs.FirstOrDefault(t => t.Id == tabId) ?? Config.Shortcuts.Tabs[0];
+        var tab = Tabs.FirstOrDefault(t => t.Id == tabId) ?? Tabs[0];
         tab.Items ??= new List<ShortcutItem>();
         tab.Items.Insert(Math.Clamp(index, 0, tab.Items.Count), item);
         ActiveTabId = tab.Id;
@@ -768,6 +967,12 @@ public sealed class AppController
     {
         item.Id = ShortcutTab.NewId();
         foreach (var c in item.Children) c.Id = ShortcutTab.NewId();
+    }
+
+    private static void ReassignModuleIds(ShortcutModule m)
+    {
+        m.Id = ShortcutModule.NewId();
+        foreach (var t in m.Tabs) ReassignTabIds(t);
     }
 
     private static void ReassignTabIds(ShortcutTab tab)

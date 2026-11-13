@@ -210,7 +210,7 @@ public sealed class TrayHost : IDisposable
                 uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 uCallbackMessage = CallbackMessage,
                 hIcon = _hIcon,
-                szTip = "桌面助手 · DeskLite v1.6",
+                szTip = "桌面助手 · DeskLite v1.7",
                 szInfo = string.Empty,
                 szInfoTitle = string.Empty
             };

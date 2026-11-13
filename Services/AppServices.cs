@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using DeskLite.Models;
 
@@ -50,6 +51,9 @@ public sealed class ConfigStore
         EnsureDefaults();
         // 启动时就落地一份清单，避免「没有任何配置变更」时根目录缺少快捷方式记录。
         WriteManifest();
+        // v1.7：旧版 tabs → Modules 的迁移必须在启动即写回 config.json，
+        // 否则手动模式（启动时不请求保存）会一直保留旧格式，直到用户首次改动才升级。
+        Save();
     }
 
     private AppConfig Load()
@@ -69,6 +73,8 @@ public sealed class ConfigStore
 
     private void EnsureDefaults()
     {
+        // v1.7：无论来自哪个历史版本，落盘一律升到 Schema=3（模块结构）。
+        Config.Schema = 3;
         Config.Icon.Mode = Config.Icon.Mode == "manual" ? "manual" : "auto";
         Config.Icon.BubbleMs = Math.Clamp(Config.Icon.BubbleMs, 500, 20000);
         Config.Icon.ConfirmMs = Math.Clamp(Config.Icon.ConfirmMs, 500, 60000);
@@ -79,21 +85,31 @@ public sealed class ConfigStore
         Config.Recent.Cols = Math.Clamp(Config.Recent.Cols, 2, 10);
         Config.Recent.Cap = Math.Clamp(Config.Recent.Cap, 10, 1024);
         Config.Recent.Items ??= new List<RecentItem>();
-        Config.Shortcuts.Tabs ??= new List<ShortcutTab>();
         // v1.5：旧版本配置没有 recycle 字段，这里补齐并按 1..3650 天钳制保留期。
         if (Config.Recycle == null) Config.Recycle = new RecycleConfig();
         Config.Recycle.Entries ??= new List<RecycleEntry>();
         Config.Recycle.RetentionDays = Math.Clamp(Config.Recycle.RetentionDays, 1, 3650);
-        if (Config.Shortcuts.Tabs.Count == 0)
+
+        // ---- v1.7 模块迁移 ----
+        // 旧配置的顶层 tabs 已由 ShortcutConfig.Tabs 的 setter 自动包装成第一个模块；
+        // 全新配置（或手工删空 modules）则在这里补建一个默认模块，保证永远至少一个。
+        if (Config.Shortcuts.Modules == null) Config.Shortcuts.Modules = new List<ShortcutModule>();
+        if (Config.Shortcuts.Modules.Count == 0) Config.Shortcuts.Modules.Add(new ShortcutModule());
+        foreach (var m in Config.Shortcuts.Modules)
         {
-            foreach (var name in new[] { "工作", "开发", "娱乐", "素材", "临时" })
-                Config.Shortcuts.Tabs.Add(new ShortcutTab { Name = name });
-        }
-        // 旧配置或手工编辑过的 JSON 可能缺字段；补齐后再交给 UI 遍历，避免空引用。
-        foreach (var tab in Config.Shortcuts.Tabs)
-        {
-            tab.Items ??= new List<ShortcutItem>();
-            foreach (var item in tab.Items) item.Children ??= new List<ShortcutItem>();
+            if (string.IsNullOrWhiteSpace(m.Id)) m.Id = ShortcutModule.NewId();
+            if (string.IsNullOrWhiteSpace(m.Name)) m.Name = "快捷方式管理";
+            m.Tabs ??= new List<ShortcutTab>();
+            if (m.Tabs.Count == 0)
+                foreach (var name in new[] { "工作", "开发", "娱乐", "素材", "临时" })
+                    m.Tabs.Add(new ShortcutTab { Name = name });
+            if (m.Tabs.All(t => t.Id != m.ActiveTabId)) m.ActiveTabId = m.Tabs[0].Id;
+            // 旧配置或手工编辑过的 JSON 可能缺字段；补齐后再交给 UI 遍历，避免空引用。
+            foreach (var tab in m.Tabs)
+            {
+                tab.Items ??= new List<ShortcutItem>();
+                foreach (var item in tab.Items) item.Children ??= new List<ShortcutItem>();
+            }
         }
     }
 
@@ -127,34 +143,49 @@ public sealed class ConfigStore
         catch { /* 写盘失败不阻断运行 */ }
     }
 
-    /// <summary>在数据根目录写一份当前所有快捷方式的清单；用 Utf8JsonWriter 手写，保持零反射。</summary>
+    /// <summary>
+    /// 在数据根目录写一份当前所有快捷方式的清单；用 Utf8JsonWriter 手写，保持零反射。
+    /// v1.7：按模块分组输出，每个模块自带名称、大类与条目；顶层同时回显第一模块的 tabs 供旧版本读取。
+    /// </summary>
     private void WriteManifest()
     {
         try
         {
             using var ms = new MemoryStream();
-            using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
+            using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true,
+                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
             {
                 w.WriteStartObject();
-                w.WriteString("app", "DeskLite v1.6");
+                w.WriteString("app", "DeskLite v1.7");
                 w.WriteString("generatedAt", DateTimeOffset.UtcNow.ToString("O"));
-                w.WriteNumber("tabCount", Config.Shortcuts.Tabs.Count);
+                w.WriteNumber("moduleCount", Config.Shortcuts.Modules.Count);
+                // 兼容旧口径：tabCount 统计所有模块的大类总数。
+                w.WriteNumber("tabCount", Config.Shortcuts.Modules.Sum(m => m.Tabs.Count));
                 w.WriteNumber("recycleCount", Config.Recycle.Entries.Count);
                 w.WriteNumber("recycleRetentionDays", Config.Recycle.RetentionDays);
-                w.WriteStartArray("tabs");
-                foreach (var tab in Config.Shortcuts.Tabs)
+                w.WriteStartArray("modules");
+                foreach (var module in Config.Shortcuts.Modules)
                 {
                     w.WriteStartObject();
-                    w.WriteString("id", tab.Id);
-                    w.WriteString("name", tab.Name);
-                    w.WriteStartArray("shortcuts");
-                    foreach (var item in tab.Items)
+                    w.WriteString("id", module.Id);
+                    w.WriteString("name", module.Name);
+                    w.WriteStartArray("tabs");
+                    foreach (var tab in module.Tabs)
                     {
                         w.WriteStartObject();
-                        w.WriteString("name", item.DisplayName);
-                        w.WriteString("type", item.Type);
-                        w.WriteString("path", item.Type == "folder" ? item.SourceDir ?? "" : item.Target);
-                        w.WriteNumber("children", item.Children?.Count ?? 0);
+                        w.WriteString("id", tab.Id);
+                        w.WriteString("name", tab.Name);
+                        w.WriteStartArray("shortcuts");
+                        foreach (var item in tab.Items)
+                        {
+                            w.WriteStartObject();
+                            w.WriteString("name", item.DisplayName);
+                            w.WriteString("type", item.Type);
+                            w.WriteString("path", item.Type == "folder" ? item.SourceDir ?? "" : item.Target);
+                            w.WriteNumber("children", item.Children?.Count ?? 0);
+                            w.WriteEndObject();
+                        }
+                        w.WriteEndArray();
                         w.WriteEndObject();
                     }
                     w.WriteEndArray();
@@ -177,7 +208,8 @@ public sealed class ConfigStore
         try
         {
             using var ms = new MemoryStream();
-            using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
+            using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true,
+                Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
             {
                 w.WriteStartObject();
                 w.WriteString("id", e.Id);
@@ -186,11 +218,20 @@ public sealed class ConfigStore
                 w.WriteNumber("deletedAt", e.DeletedAt);
                 w.WriteString("deletedAtLocal",
                     DateTimeOffset.FromUnixTimeMilliseconds(e.DeletedAt).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"));
-                w.WriteString("from", string.IsNullOrWhiteSpace(e.ParentName)
-                    ? e.TabName : e.TabName + " › " + e.ParentName);
+                // v1.7：标注来源模块，模块级记录额外记录其大类 / 条目总数。
+                w.WriteString("moduleName", e.ModuleName ?? "");
+                w.WriteString("from", string.IsNullOrWhiteSpace(e.ModuleName)
+                    ? (string.IsNullOrWhiteSpace(e.ParentName) ? e.TabName : e.TabName + " › " + e.ParentName)
+                    : e.ModuleName + " › " + (string.IsNullOrWhiteSpace(e.ParentName) ? e.TabName : e.TabName + " › " + e.ParentName));
                 w.WriteString("sourcePath", e.SourcePath ?? "");
                 w.WriteNumber("retainedDays", Config.Recycle.RetentionDays);
                 if (e.Tab != null) w.WriteNumber("containedItems", e.Tab.Items?.Count ?? 0);
+                if (e.Module != null)
+                {
+                    w.WriteNumber("containedTabs", e.Module.Tabs?.Count ?? 0);
+                    w.WriteNumber("containedItems",
+                        e.Module.Tabs?.Sum(t => t.Items?.Count ?? 0) ?? 0);
+                }
                 if (e.Item != null)
                 {
                     w.WriteString("itemType", e.Item.Type);
