@@ -3,7 +3,7 @@
 > 一个轻量、低资源占用、响应迅速的 Windows 桌面收纳工具。
 > A lightweight, low-footprint, and responsive desktop organizer for Windows.
 
-**当前版本 / Current version: v1.7.0**
+**当前版本 / Current version: v1.8.0**
 
 - 中文：`Windows 桌面快捷方式与文件轻量收纳工具（WinUI 3）`
 - English: `A lightweight Windows desktop organizer for shortcuts & files, built with WinUI 3.`
@@ -16,8 +16,8 @@
 
 | 文件 / File | 说明 / Description |
 | --- | --- |
-| **`v1.7.0_DeskLite-win-x64-selfextract.exe`** | **推荐 / Recommended** — 自解压 EXE：双击后自动解压运行环境并启动 DeskLite，无需安装 .NET 或 Windows App SDK。首次运行需解压约 230 MB 运行时，请稍候数秒。/ Self-extracting EXE: double-click to unpack the bundled runtime and launch DeskLite. |
-| `v1.7.0_DeskLite-win-x64-selfcontained.zip` | 完整自包含发布包：解压到任意目录后运行其中的 `DeskLite.exe`，适合固定目录、反复启动的场景。/ Full self-contained package: unzip anywhere and run `DeskLite.exe`. |
+| **`v1.8.0_DeskLite-win-x64-selfcontained.zip`** | **推荐 / Recommended** — 完整自包含 ZIP：解压到任意目录后运行 `DeskLite.exe`，无需另装 .NET 或 Windows App SDK。/ Full self-contained package: unzip anywhere and run `DeskLite.exe`.
+| `v1.8.0_DeskLite-win-x64-selfcontained.zip` | 同一自包含包，也适合固定目录、反复启动的场景。/ Same standalone package for repeated use from a fixed folder.
 
 > 环境要求 / Requirements: Windows 10 19041 (2004) 或更高版本，x64。
 > 首次运行时程序会在 `%APPDATA%\DeskLite\` 创建配置目录，不会改写磁盘上的快捷方式源文件。
@@ -30,6 +30,13 @@
 ### 这是什么
 
 DeskLite 是一款面向 Windows 的桌面管理工具，灵感来自 DeskBox 的交互样式。当桌面上的快捷方式、临时文件越来越多、越来越杂乱时，DeskLite 把它们收进一个无边框、可常驻桌面的小窗里，让桌面回归干净。
+
+### v1.8 新增：窗口边缘自动停靠
+
+- 启动后可将窗口隐藏在屏幕顶部中央或右侧边缘，通过箭头直接展开；失焦后自动收回，不播放滚动动画。
+- 顶部停靠时窗口 Y 坐标固定为 0，箭头中心与窗口外框水平中心对齐。
+- 可调窗口沿屏幕边缘的位置，也可拖动标题栏改变停靠位置。
+- 项目使用 .NET 10；构建脚本显式调用独立 SDK，不会覆盖系统中的 .NET 9 SDK。
 
 ### v1.7 新增：模块化的「快捷方式管理」
 

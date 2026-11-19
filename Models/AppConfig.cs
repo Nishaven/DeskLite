@@ -199,6 +199,10 @@ public sealed class UiConfig
     public string Theme { get; set; } = "system";
     public bool StartWithWindows { get; set; } = true;
     public bool MinimizeToTray { get; set; } = true;
+    /// <summary>启动后停靠隐藏的位置：off | top-center | right-edge；默认收至桌面顶部中央。</summary>
+    public string DockHideMode { get; set; } = "top-center";
+    /// <summary>停靠边缘上展开窗口的位置百分比（0–100）。</summary>
+    public double DockWindowPosition { get; set; } = 50;
     /// <summary>v1.5 可行性分析落地：调用快捷方式自身的系统图标；关闭则回退零开销彩色占位图标。</summary>
     public bool UseRealIcons { get; set; } = true;
     /// <summary>v1.6：提取图标时隐藏 .lnk / .url 左下角的快捷方式箭头角标（默认隐藏，设置页可关）。</summary>

@@ -30,12 +30,15 @@ public sealed partial class MainWindow : Window
     private TrayHost? _tray;
     private bool _loadingSettings;
     private bool _hidden;
+    private bool _edgeCollapsed;
     private bool _settingSignal;
     private DateTime _nextThemeCheck;
     private DateTime _lastSignalCheck;
 
     // 主布局
     private Grid _root = null!;
+    private Grid _dockLayer = null!;
+    private Button _dockArrow = null!;
     private Grid _mainLayout = null!;
     private Grid _overlay = null!;
     private Grid _recentGrid = null!;
@@ -114,7 +117,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Title = "桌面助手 · DeskLite v1.7";
+        Title = "桌面助手 · DeskLite v1.8";
         _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         // v1.4-5：无边框窗口（无系统标题栏 / 关闭按钮），设置与托盘右键是唯一退出通道
         ConfigureBorderless();
@@ -178,8 +181,14 @@ public sealed partial class MainWindow : Window
         };
         _timer.Start();
 
-        Activated += (_, _) =>
+        Activated += (_, e) =>
         {
+            if (e.WindowActivationState == WindowActivationState.Deactivated)
+            {
+                if (!_hidden && !_edgeCollapsed && _c.Config.Ui.DockHideMode != "off")
+                    _root.DispatcherQueue.TryEnqueue(CollapseToDock);
+                return;
+            }
             _c.RecheckNow();
             if (UiTheme.RefreshIfNeeded()) RebuildUiForTheme();
         };
@@ -229,14 +238,18 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _timer.Stop();
-            WindowState.Save(_hwnd, _c.Config.Ui);
+            if (!_edgeCollapsed) WindowState.Save(_hwnd, _c.Config.Ui);
             _c.SaveNow();
             _tray?.Dispose();
         };
+
+        // 启动后直接收至用户设置的屏幕边缘，留下箭头按钮作为唤起入口。
+        if (_c.Config.Ui.DockHideMode != "off") CollapseToDock();
     }
 
     private void ShowFromTray()
     {
+        if (_edgeCollapsed) ExpandFromDock();
         TrayHost.BringToFront(_hwnd);
         _hidden = false;
         _c.RecheckNow();
@@ -253,6 +266,65 @@ public sealed partial class MainWindow : Window
     {
         WindowState.Save(_hwnd, _c.Config.Ui);
         _c.SaveNow();
+    }
+
+    private void SetDockHideMode(int index)
+    {
+        string mode = index == 1 ? "top-center" : index == 2 ? "right-edge" : "off";
+        if (_c.Config.Ui.DockHideMode == mode) return;
+        _c.Config.Ui.DockHideMode = mode;
+        _c.SaveNow();
+
+        if (mode == "off")
+        {
+            if (_edgeCollapsed) ExpandFromDock();
+            else NativeWindow.SetTopmost(_hwnd, false);
+        }
+        else
+        {
+            if (_dockArrow?.Content is TextBlock arrow)
+                arrow.Text = mode == "right-edge" ? "‹" : "⌄";
+            CollapseToDock();
+            if (_edgeCollapsed) NativeWindow.Dock(_hwnd, mode, _c.Config.Ui);
+        }
+    }
+
+    private void CollapseToDock()
+    {
+        if (_edgeCollapsed || _hidden || _dockLayer == null || _c.Config.Ui.DockHideMode == "off") return;
+        bool firstPlacement = _c.Config.Ui.WinW < 640 || _c.Config.Ui.WinH < 420;
+        SaveWindowPlacement();
+        _c.Config.Ui.DockWindowPosition = firstPlacement
+            ? 50
+            : NativeWindow.ReadEdgePosition(_hwnd, _c.Config.Ui.DockHideMode);
+        _c.SaveNow();
+        _edgeCollapsed = true;
+        _mainLayout.Visibility = Visibility.Collapsed;
+        _overlay.Visibility = Visibility.Collapsed;
+        _dockLayer.Visibility = Visibility.Visible;
+        NativeWindow.Dock(_hwnd, _c.Config.Ui.DockHideMode, _c.Config.Ui);
+    }
+
+    private void ExpandFromDock()
+    {
+        if (!_edgeCollapsed) return;
+        _edgeCollapsed = false;
+        _dockLayer.Visibility = Visibility.Collapsed;
+        _mainLayout.Visibility = Visibility.Visible;
+        _overlay.Visibility = Visibility.Visible;
+        NativeWindow.RestoreFromDock(_hwnd, _c.Config.Ui, _c.Config.Ui.DockHideMode != "off");
+    }
+
+    private void SetDockWindowPosition(double value)
+    {
+        _c.Config.Ui.DockWindowPosition = Math.Clamp(value, 0, 100);
+        _c.SaveNow();
+    }
+
+    private void ApplyDockWindowPosition()
+    {
+        if (!_edgeCollapsed && _c.Config.Ui.DockHideMode != "off")
+            NativeWindow.PositionExpandedAtEdge(_hwnd, _c.Config.Ui);
     }
 
     /// <summary>切换主题档位：重建整棵控件树，并重置按需刷新缓存以免状态文字不更新。</summary>
@@ -328,6 +400,14 @@ public sealed partial class MainWindow : Window
     {
         private const uint WM_NCLBUTTONDOWN = 0x00A1;
         private const int HTBOTTOMRIGHT = 17;
+        private static readonly IntPtr HWND_TOPMOST = new(-1);
+        private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int index);
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool ReleaseCapture();
@@ -341,6 +421,101 @@ public sealed partial class MainWindow : Window
         public static void Hide(IntPtr hwnd)
         {
             try { ShowWindow(hwnd, 0); } catch { /* SW_HIDE 失败不影响主流程 */ }
+        }
+
+        public static void Dock(IntPtr hwnd, string mode, UiConfig ui)
+        {
+            try
+            {
+                int screenW = GetSystemMetrics(0), screenH = GetSystemMetrics(1);
+                const int arrowWidth = 44, arrowHeight = 38;
+                int windowW = ui.WinW >= 640 ? Math.Min(ui.WinW, Math.Max(240, screenW)) : 1020;
+                int windowH = ui.WinH >= 420 ? Math.Min(ui.WinH, Math.Max(160, screenH)) : 730;
+                double ratio = Math.Clamp(ui.DockWindowPosition, 0, 100) / 100.0;
+                int x, y;
+                if (mode == "right-edge")
+                {
+                    int windowY = (int)Math.Round(Math.Max(0, screenH - windowH) * ratio);
+                    x = Math.Max(0, screenW - arrowWidth);
+                    y = windowY + Math.Max(0, (windowH - arrowHeight) / 2);
+                }
+                else
+                {
+                    int windowX = (int)Math.Round(Math.Max(0, screenW - windowW) * ratio);
+                    x = windowX + Math.Max(0, (windowW - arrowWidth) / 2);
+                    y = 0;
+                }
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, arrowWidth, arrowHeight, 0x0010 | 0x0040); // NOACTIVATE | SHOWWINDOW
+            }
+            catch { /* 停靠失败时保留主窗口 */ }
+        }
+
+        public static void RestoreFromDock(IntPtr hwnd, UiConfig ui, bool topmost)
+        {
+            try
+            {
+                int screenW = GetSystemMetrics(0), screenH = GetSystemMetrics(1);
+                int w = ui.WinW >= 640 ? ui.WinW : 1020;
+                int h = ui.WinH >= 420 ? ui.WinH : 730;
+                w = Math.Min(w, Math.Max(240, screenW));
+                h = Math.Min(h, Math.Max(160, screenH));
+                double ratio = Math.Clamp(ui.DockWindowPosition, 0, 100) / 100.0;
+                int x, y;
+                if (ui.DockHideMode == "right-edge")
+                {
+                    x = Math.Max(0, screenW - w);
+                    y = (int)Math.Round(Math.Max(0, screenH - h) * ratio);
+                }
+                else
+                {
+                    x = (int)Math.Round(Math.Max(0, screenW - w) * ratio);
+                    y = 0;
+                }
+                SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h, 0x0010 | 0x0040);
+            }
+            catch { /* 恢复失败不影响其它功能 */ }
+        }
+
+        public static double ReadEdgePosition(IntPtr hwnd, string mode)
+        {
+            try
+            {
+                if (!GetWindowRect(hwnd, out var r)) return 50;
+                int screenW = GetSystemMetrics(0), screenH = GetSystemMetrics(1);
+                double span = mode == "right-edge"
+                    ? Math.Max(1, screenH - (r.Bottom - r.Top))
+                    : Math.Max(1, screenW - (r.Right - r.Left));
+                double offset = mode == "right-edge" ? r.Top : r.Left;
+                return Math.Clamp(offset / span * 100, 0, 100);
+            }
+            catch { return 50; }
+        }
+
+        public static void PositionExpandedAtEdge(IntPtr hwnd, UiConfig ui)
+        {
+            try
+            {
+                if (!GetWindowRect(hwnd, out var r)) return;
+                int screenW = GetSystemMetrics(0), screenH = GetSystemMetrics(1);
+                int w = r.Right - r.Left, h = r.Bottom - r.Top;
+                double ratio = Math.Clamp(ui.DockWindowPosition, 0, 100) / 100.0;
+                int x = ui.DockHideMode == "right-edge" ? Math.Max(0, screenW - w) : (int)Math.Round(Math.Max(0, screenW - w) * ratio);
+                int y = ui.DockHideMode == "right-edge" ? (int)Math.Round(Math.Max(0, screenH - h) * ratio) : 0;
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, 0x0010 | 0x0040);
+            }
+            catch { /* 调整位置失败不影响主窗口 */ }
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        public static void SetTopmost(IntPtr hwnd, bool topmost)
+        {
+            try { SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); }
+            catch { /* 忽略置顶状态切换失败 */ }
         }
 
         public static void BeginResize(IntPtr hwnd)
@@ -513,6 +688,24 @@ public sealed partial class MainWindow : Window
         BuildOverlays();
         _root.Children.Add(_overlay);
 
+        _dockLayer = new Grid { Visibility = _edgeCollapsed ? Visibility.Visible : Visibility.Collapsed };
+        _dockArrow = new Button
+        {
+            Content = T(_c.Config.Ui.DockHideMode == "right-edge" ? "‹" : "⌄", 20, "#FFFFFF", true),
+            Width = 44, Height = 38,
+            Background = B("#6C55A4", 0.96),
+            BorderBrush = B("#C8B6FF", 0.68),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        ToolTipService.SetToolTip(_dockArrow, "点击展开桌面助手");
+        _dockArrow.Click += (_, _) => ExpandFromDock();
+        _dockLayer.Children.Add(_dockArrow);
+        _root.Children.Add(_dockLayer);
+
         // v1.3：根容器是唯一拖放目标。它有实际背景、覆盖整个客户区，任何位置都能命中；
         // 旧版只挂在透明的一层网格上，空白处无法命中，导致从资源管理器拖放几乎总是无效。
         // _root 在主题切换时会被复用，因此只挂一次事件，避免重复处理。
@@ -563,7 +756,7 @@ public sealed partial class MainWindow : Window
         var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8,
             VerticalAlignment = VerticalAlignment.Center };
         brand.Children.Add(T("桌面助手", 13, bold: true));
-        brand.Children.Add(T("v1.7 · 快捷方式管理多模块", 10, "#8A829C"));
+        brand.Children.Add(T("v1.8 · 边缘停靠隐藏 · 快捷方式管理多模块", 10, "#8A829C"));
 
         var seg = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, Padding = new Thickness(2),
             Background = B("#FFFFFF", 0.06), CornerRadius = new CornerRadius(9) };
@@ -882,7 +1075,7 @@ public sealed partial class MainWindow : Window
         _statusText = T("空闲", 10.5, "#4CD08A");
         _modeText = T("自动（跟随桌面）", 10.5, "#8A829C");
         _modeText.Margin = new Thickness(16, 0, 0, 0);
-        var note = T("v1.7 · 快捷方式管理 N 模块 · 真实图标（默认无箭头） · 待回收区 7 天 · 右键修改/删除 · 设置中退出", 10, "#8A829C");
+        var note = T("v1.8 · 顶部/右侧停靠隐藏 · 快捷方式管理 N 模块 · 真实图标 · 待回收区 7 天", 10, "#8A829C");
         note.HorizontalAlignment = HorizontalAlignment.Right;
         Grid.SetColumn(_statusText, 0); Grid.SetColumn(_modeText, 1); Grid.SetColumn(note, 2);
         g.Children.Add(_statusText); g.Children.Add(_modeText); g.Children.Add(note);
@@ -1254,6 +1447,9 @@ public sealed partial class MainWindow : Window
                 i => ApplyTheme(i == 1 ? "light" : i == 2 ? "dark" : "system"))));
         body.Children.Add(SettingRow("↻", "开机自启", "写入当前用户 Run 项，随 Windows 登录启动",
             SwitchControl(_c.Config.Ui.StartWithWindows, v => { _c.Config.Ui.StartWithWindows = v; ApplyStartup(v); _c.SaveNow(); })));
+        body.Children.Add(SettingRow("⇥", "自动停靠隐藏", "启动后收至屏幕顶部中央或右侧边缘，点击箭头展开；窗口失焦后自动收起",
+            ComboControl(new[] { "关闭", "顶部中央", "右侧边缘" }, _c.Config.Ui.DockHideMode switch { "top-center" => 1, "right-edge" => 2, _ => 0 }, SetDockHideMode)));
+        body.Children.Add(SettingRow("▭", "展开窗口位置", "顶部模式 Y 固定为 0；箭头中心对齐窗口外框中心。可调沿边位置或拖动标题栏", PercentSlider(_c.Config.Ui.DockWindowPosition, SetDockWindowPosition, _ => ApplyDockWindowPosition())));
         var exitBtn = Bt("退出 DeskLite", (_, _) => ConfirmExit(), "#FFFFFF");
         exitBtn.Background = B("#C94F6D", 0.9);
         exitBtn.BorderBrush = B("#C94F6D");
@@ -1283,8 +1479,8 @@ public sealed partial class MainWindow : Window
             })));
         body.Children.Add(SettingRow("⇩", "外部文件拖放", "窗口已登记为系统拖放目标；拖到标签页可指定大类，拖入过程见 dragdrop.log",
             ReadOnlyControl("双通道已启用")));
-        body.Children.Add(SettingRow("关于", "桌面助手 v1.7",
-            "WinUI 3 / Windows App SDK 2.5.1 / .NET 10 · 快捷方式管理可拓展 N 模块 · 待回收区 · 真实图标（默认无箭头角标）",
+        body.Children.Add(SettingRow("关于", "桌面助手 v1.8",
+            "WinUI 3 / Windows App SDK 2.5.1 / .NET 10 · 顶部中央或右侧边缘停靠隐藏 · 快捷方式管理 N 模块",
             ReadOnlyControl("增量版本")));
 
         scroll.Content = body;
@@ -1347,6 +1543,24 @@ public sealed partial class MainWindow : Window
         s.ValueChanged += (_, e) => { t.Text = $"{(int)e.NewValue} px"; if (!_loadingSettings) _c.SetManualPx((int)e.NewValue); };
         p.Children.Add(s); p.Children.Add(t);
         return p;
+    }
+
+    private FrameworkElement PercentSlider(double value, Action<double> onChange, Action<double>? onCommit = null)
+    {
+        var slider = new Slider { Minimum = 0, Maximum = 100, StepFrequency = 1, Value = Math.Clamp(value, 0, 100), Width = 150 };
+        var label = T($"{(int)Math.Round(slider.Value)}%", 11);
+        label.Width = 34;
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        slider.ValueChanged += (_, e) =>
+        {
+            label.Text = $"{(int)Math.Round(e.NewValue)}%";
+            if (!_loadingSettings) onChange(e.NewValue);
+        };
+        slider.PointerReleased += (_, _) => { if (!_loadingSettings) onCommit?.Invoke(slider.Value); };
+        slider.KeyUp += (_, _) => { if (!_loadingSettings) onCommit?.Invoke(slider.Value); };
+        row.Children.Add(slider);
+        row.Children.Add(label);
+        return row;
     }
 
     private FrameworkElement ComboControl(string[] items, int selected, Action<int> onChange)

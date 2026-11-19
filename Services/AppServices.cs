@@ -156,7 +156,7 @@ public sealed class ConfigStore
                 Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
             {
                 w.WriteStartObject();
-                w.WriteString("app", "DeskLite v1.7");
+                w.WriteString("app", "DeskLite v1.8");
                 w.WriteString("generatedAt", DateTimeOffset.UtcNow.ToString("O"));
                 w.WriteNumber("moduleCount", Config.Shortcuts.Modules.Count);
                 // 兼容旧口径：tabCount 统计所有模块的大类总数。
